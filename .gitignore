@@ -1,0 +1,11 @@
+# .gitignore
+.env
+__pycache__/
+*.pyc
+.DS_Store
+venv/
+service-account.json
+logs/
+# IDE Settings (Do not upload)
+.idea/
+*.iml
