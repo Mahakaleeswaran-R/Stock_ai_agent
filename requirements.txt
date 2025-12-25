@@ -1,0 +1,15 @@
+python-dotenv
+redis
+motor
+google-genai
+smartapi-python
+pandas
+pandas-ta
+aiohttp
+feedparser
+tenacity
+pypdf
+firebase-admin
+APScheduler
+pyotp
+requests
