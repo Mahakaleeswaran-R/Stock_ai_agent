@@ -43,7 +43,7 @@ graph TD
 
 ### 🧠 1. "Cynical" AI Analysis
 
-Uses **Google Gemini 1.5 Flash** with a specifically engineered "Hedge Fund Persona."
+Uses **Google gemma** with a specifically engineered "Hedge Fund Persona."
 
 * **PDF Parsing:** Automatically downloads and reads corporate PDFs/XBRL filings.
 * **Noise Filtering:** Ignores "Strategic Partnerships" or "MoUs" without financial backing.
