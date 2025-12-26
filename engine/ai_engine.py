@@ -18,7 +18,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger("AI_ENGINE")
 
 MODEL_NAME = "gemma-3-27b-it"
-RATE_LIMIT_COOLDOWN = 10.0
+RATE_LIMIT_COOLDOWN = 5.0
 CONTEXT_CHAR_LIMIT = 30000
 
 HEADERS = {
