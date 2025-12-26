@@ -1,5 +1,8 @@
 import asyncio
 import logging
+import os
+import threading
+from flask import Flask
 
 from producers.event_poller import RSSEventFetcher
 from engine.event_filter import EventFilter
@@ -13,8 +16,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger("STOCK_AGENT")
 
+app = Flask(__name__)
 
-async def main():
+@app.route('/')
+def home():
+    return "Stock Trading Agent is RUNNING (Async Core Active)"
+
+def run_web_server():
+    port = int(os.environ.get("PORT", 5000))
+    logger.info(f"Starting Web Server on port {port}...")
+    app.run(host='0.0.0.0', port=port)
+
+async def start_async_core():
     logger.info("STARTING TRADING SYSTEM CORE...")
 
     poller = RSSEventFetcher()
@@ -43,13 +56,27 @@ async def main():
         for task in tasks:
             if not task.done():
                 task.cancel()
+        
         await asyncio.gather(*tasks, return_exceptions=True)
-        await poller.close()
+        
+        if hasattr(poller, 'close'):
+            await poller.close()
+            
         logger.info("System Shutdown Complete.")
 
+def run_async_loop_in_thread():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(start_async_core())
+    finally:
+        loop.close()
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        t = threading.Thread(target=run_async_loop_in_thread, daemon=True)
+        t.start()
+        run_web_server()
+        
     except KeyboardInterrupt:
-        pass
+        logger.info("Manual Stop Triggered")
