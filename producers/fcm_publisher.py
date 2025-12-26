@@ -10,7 +10,13 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger("FCM_PUBLISHER")
 
 try:
-    cred = credentials.Certificate("../service-account.json")
+    if os.path.exists("/etc/secrets/service-account.json"):
+        cred_path = "/etc/secrets/service-account.json"
+        logger.info("Loading Firebase Creds from Render Secret File...")
+    else:
+        cred_path = "./service-account.json"
+        logger.info("Loading Firebase Creds from Local File...")
+    cred = credentials.Certificate(cred_path)
     firebase_admin.initialize_app(cred)
     logger.info("Firebase Admin Initialized")
 except ValueError:
