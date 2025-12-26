@@ -4,6 +4,7 @@ import logging
 import firebase_admin
 from firebase_admin import credentials, messaging, exceptions
 from config import redis_client
+import functools
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("FCM_PUBLISHER")
@@ -58,7 +59,13 @@ async def send_notification(signal):
             topic=TOPIC_NAME,
             android=messaging.AndroidConfig(priority='high')
         )
-        response = messaging.send(message)
+        
+        loop = asyncio.get_running_loop()
+        send_func = functools.partial(
+            messaging.send, 
+            message
+        )
+        response = await loop.run_in_executor(None, send_func)
         logger.info(f"Sent: {symbol} ({side}) | ID: {response}")
         return True
 
