@@ -13,3 +13,5 @@ firebase-admin
 APScheduler
 pyotp
 requests
+flask
+logzero
