@@ -9,6 +9,8 @@ from engine.event_filter import EventFilter
 from engine.ai_engine import AIEngine
 from engine.technical_engine import TechnicalEngine
 from producers.fcm_publisher import run as run_fcm
+from scheduler import start_scheduler
+from jobs.ISIN_lookup import ISINLookupService
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,6 +31,15 @@ def run_web_server():
 
 async def start_async_core():
     logger.info("STARTING TRADING SYSTEM CORE...")
+
+    logger.info("Performing Startup ISIN Lookup...")
+    try:
+        await ISINLookupService().run()
+        logger.info("Startup ISIN Lookup Complete.")
+    except Exception as e:
+        logger.error(f"Startup ISIN Failed: {e}")
+
+    start_scheduler()
 
     poller = RSSEventFetcher()
     ev_filter = EventFilter()

@@ -68,56 +68,21 @@ async def job_performance_analyser():
         logger.error(f"performance analysis Job: {e}")
 
 
-async def main():
+def start_scheduler():
     scheduler = AsyncIOScheduler(timezone=IST)
 
     # 1. ISIN Sync: 08:30 AM
-    scheduler.add_job(
-        job_isin_update,
-        CronTrigger(hour=8, minute=30, timezone=IST),
-        id='isin_update'
-    )
+    scheduler.add_job(job_isin_update, CronTrigger(hour=8, minute=30))
 
     # 2. Performance Analyzer: 04:30 PM
-    scheduler.add_job(
-    job_performance_analyser,
-    CronTrigger(hour=16, minute=30, timezone=IST),
-    id='perf_analysis'
-    )
+    scheduler.add_job(job_performance_analyser, CronTrigger(hour=16, minute=30))
 
     # 3. Feedback Layer: 08:00 PM
-    scheduler.add_job(
-        run_feedback_job,
-        CronTrigger(hour=20, minute=0, timezone=IST),
-        id='feedback_layer'
-    )
+    scheduler.add_job(run_feedback_job, CronTrigger(hour=20, minute=0))
 
     # 4. Cleanup: 11:30 PM
-    scheduler.add_job(
-        job_data_cleanup,
-        CronTrigger(hour=23, minute=30, timezone=IST),
-        id='data_cleanup'
-    )
+    scheduler.add_job(job_data_cleanup, CronTrigger(hour=23, minute=30))
 
-    logger.info("Scheduler Initialized")
     scheduler.start()
-
-    stop_event = asyncio.Event()
-    loop = asyncio.get_running_loop()
-
-    def signal_handler(sig):
-        logger.info(f"Received exit signal {sig.name}...")
-        stop_event.set()
-
-    signals = (sgnl.SIGHUP, sgnl.SIGTERM, sgnl.SIGINT)
-    for s in signals:
-        loop.add_signal_handler(s, lambda s=s: signal_handler(s))
-    await stop_event.wait()
-    logger.info("Scheduler Stopped.")
-
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        pass
+    logger.info("Scheduler Active")
+    return scheduler
