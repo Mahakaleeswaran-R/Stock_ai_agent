@@ -15,4 +15,4 @@ pyotp
 requests
 flask
 logzero
-websocket
+websocket-client
