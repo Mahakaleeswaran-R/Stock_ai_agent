@@ -18,7 +18,7 @@ IST = pytz.timezone('Asia/Kolkata')
 logger = logging.getLogger("EVENT_POLLER")
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
-POLL_INTERVAL_SECONDS = 5
+POLL_INTERVAL_SECONDS = 10
 REDIS_EXPIRY = 86400 * 1
 
 RSS_SOURCES = {
