@@ -234,6 +234,11 @@ class RSSEventFetcher:
 
     async def _dispatch_to_redis(self, event):
 
+        if event['source'] == 'BSE':
+            scrip = str(event.get('scrip_code', ''))
+            if scrip and (scrip.startswith('9') or scrip.startswith('8') or scrip.startswith('7')):
+                return
+
         evt_id = event['event_id']
         if evt_id in self.local_seen_cache:
             return

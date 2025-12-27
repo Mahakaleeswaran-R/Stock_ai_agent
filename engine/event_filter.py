@@ -126,12 +126,6 @@ async def _is_noise(event):
     if any(x in name for x in ["MUTUAL FUND", "ETF", "BOND", "NIFTY 50", "SENSEX"]):
         return True, "NON_EQUITY", None
 
-    # 2. BSE Debt Scrip Check (7, 8, 9 series)
-    if event['source'] == 'BSE':
-        scrip = str(event.get('scrip_code', ''))
-        if scrip and (scrip.startswith('9') or scrip.startswith('8') or scrip.startswith('7')):
-            return True, f"DEBT_INSTRUMENT ({scrip})", None
-
     # 3. Bad Keywords
     for kw in CACHED_BAD_KEYWORDS:
         keyword = kw.upper()
