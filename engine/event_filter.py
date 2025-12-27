@@ -48,7 +48,18 @@ def json_serial(obj):
     raise TypeError(f"Type {type(obj)} not serializable")
 
 
+async def _update_last_event_cache(key, event):
+    cache_data = {
+        "title": event['title'],
+        "summary": event.get('summary', ''),
+        "timestamp": event['timestamp'],
+        "source": event['source']
+    }
+    await redis_client.setex(key, 3600, json.dumps(cache_data))
+
+
 async def _check_smart_similarity(isin, current_event):
+    if not isin: return False
     last_event_key = f"CACHE:LAST_EVENT:{isin}"
     last_event_raw = await redis_client.get(last_event_key)
 
@@ -56,62 +67,25 @@ async def _check_smart_similarity(isin, current_event):
         last_event = json.loads(last_event_raw)
         last_ts = datetime.fromisoformat(last_event['timestamp'])
         curr_ts = datetime.fromisoformat(current_event['timestamp'])
-        if abs((curr_ts - last_ts).total_seconds()) < 600:
+        if abs((curr_ts - last_ts).total_seconds()) > 1200:
+            await _update_last_event_cache(last_event_key, current_event)
+            return False
+        def clean(t):
+            return re.sub(r'[^A-Z0-9]', '', t.upper())
+        title_a = clean(last_event['title'])
+        title_b = clean(current_event['title'])
+        ratio = difflib.SequenceMatcher(None, title_a, title_b).ratio()
+        is_dupe = False
+        if last_event['source'] == current_event['source']:
+            if ratio > 0.90: is_dupe = True
+        else:
+            if ratio > 0.70: is_dupe = True
 
-            def get_numbers(text):
-                return set(re.findall(r'\d+(?:\.\d+)?', text))
-
-
-            def clean_text(text, company_name):
-                t = text.upper()
-                t = t.replace(company_name.upper(), "")
-                fillers = [
-                    "LIMITED", "LTD", "HAS INFORMED THE EXCHANGE", "REGARDING",
-                    "SUB:", "SUBJECT:", "DISCLOSURE OF", "INTIMATION OF",
-                    "PURSUANT TO", "REGULATION", "SEBI", "WE HEREBY SUBMIT"
-                ]
-                for f in fillers:
-                    t = t.replace(f, "")
-                return re.sub(r'[^A-Z0-9 ]', '', t).strip()
-            clean_name = current_event['clean_name']
-            str_a = f"{last_event['title']} {last_event.get('summary', '')}"
-            str_b = f"{current_event['title']} {current_event.get('summary', '')}"
-            norm_a = clean_text(str_a, clean_name)
-            norm_b = clean_text(str_b, clean_name)
-
-            nums_a = get_numbers(str_a)
-            nums_b = get_numbers(str_b)
-            if nums_a and nums_b and not nums_a.intersection(nums_b):
-                return False
-
-            ratio = difflib.SequenceMatcher(None, norm_a, norm_b).ratio()
-            set_a = set(norm_a.split())
-            set_b = set(norm_b.split())
-
-            jaccard = 0.0
-            if set_a or set_b:
-                intersection = len(set_a.intersection(set_b))
-                union = len(set_a.union(set_b))
-                jaccard = intersection / union if union > 0 else 0
-
-            is_dupe = False
-            if last_event['source'] == current_event['source']:
-                if ratio > 0.95 or jaccard > 0.85:
-                    is_dupe = True
-            else:
-                if ratio > 0.75 or jaccard > 0.80:
-                    is_dupe = True
-            if is_dupe:
-                logger.info(
-                    f"Duplicate Blocked [R:{ratio:.2f}|J:{jaccard:.2f}]: {current_event['source']} vs {last_event['source']}")
-                return True
-    cache_data = {
-        "title": current_event['title'],
-        "summary": current_event.get('summary', ''),
-        "timestamp": current_event['timestamp'],
-        "source": current_event['source']
-    }
-    await redis_client.setex(last_event_key, 3600, json.dumps(cache_data))
+        if is_dupe:
+            logger.info(
+                f"Cross-Source Blocked [{last_event['source']} vs {current_event['source']} | Ratio: {ratio:.2f}]: {current_event['clean_name']}")
+            return True
+    await _update_last_event_cache(last_event_key, current_event)
     return False
 
 
