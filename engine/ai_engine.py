@@ -179,7 +179,7 @@ class AIEngine:
     async def producer_step(self):
         try:
             while True:
-                item = await redis_client.blpop(self.input_queue, timeout=8)
+                item = await redis_client.blpop(self.input_queue, timeout=60)
                 if item:
                     event = json.loads(item[1])
                     pdf_text = await self.fetch_pdf_text(event.get('pdf_url'))

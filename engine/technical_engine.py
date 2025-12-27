@@ -458,7 +458,7 @@ class TechnicalEngine:
         try:
             while True:
                 try:
-                    item = await redis_client.blpop(self.input_queue, timeout=30)
+                    item = await redis_client.blpop(self.input_queue, timeout=60)
                     if item:
                         asyncio.create_task(self.process_event(json.loads(item[1])))
                     else:

@@ -92,7 +92,7 @@ async def run():
     logger.info("FCM Publisher Service Active & Listening...")
     while True:
         try:
-            item = await redis_client.blpop("QUEUE:TRADE_SIGNALS", timeout=5)
+            item = await redis_client.blpop("QUEUE:TRADE_SIGNALS", timeout=60)
 
             if item:
                 raw_data = item[1]
