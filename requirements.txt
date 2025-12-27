@@ -16,3 +16,7 @@ requests
 flask
 logzero
 websocket-client
+
+python-dateutil
+pytz
+pymongo

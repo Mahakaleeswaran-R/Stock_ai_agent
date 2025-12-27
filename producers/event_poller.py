@@ -74,7 +74,8 @@ def is_relevant_stock(title):
         "CLARIFICATION ON SPURT", "CLARIFICATION ON PRICE",
         "MOVEMENT IN PRICE", "MOVEMENT IN VOLUME",
         "RATING REAFFIRMED", "RATING WITHDRAWN",
-        "REVIEW OF RATING",
+        "REVIEW OF RATING","FIXED MATURITY PLAN",
+        "DIRECT PLAN","REGULAR PLAN","BENEFIT PLAN"
     ]
     title_upper = title.upper()
     if any(keyword in title_upper for keyword in junk_keywords): return False
