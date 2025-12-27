@@ -12,6 +12,26 @@ from config import redis_client, raw_events
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("EVENT_FILTER")
 
+CACHED_BAD_KEYWORDS = set()
+CACHED_SHADOW_KEYWORDS = set()
+LAST_KEYWORD_REFRESH = datetime.min
+
+
+async def _refresh_keywords_if_needed():
+    global CACHED_BAD_KEYWORDS, CACHED_SHADOW_KEYWORDS, LAST_KEYWORD_REFRESH
+    now = datetime.now()
+    if (now - LAST_KEYWORD_REFRESH).total_seconds() > 6000:  # 100 Mins
+        try:
+            bad = await redis_client.smembers("CONFIG:BAD_KEYWORDS")
+            CACHED_BAD_KEYWORDS = {k.decode() if isinstance(k, bytes) else k for k in bad}
+
+            shadow = await redis_client.smembers("CONFIG:SHADOW_KEYWORDS")
+            CACHED_SHADOW_KEYWORDS = {k.decode() if isinstance(k, bytes) else k for k in shadow}
+
+            LAST_KEYWORD_REFRESH = now
+        except:
+            pass
+
 
 async def _get_isin(join_key, source):
     redis_key = f"CONFIG:ISIN:{source}"
@@ -95,26 +115,9 @@ async def _check_smart_similarity(isin, current_event):
     return False
 
 
-async def _is_duplicate(event):
-    if await redis_client.exists(f"DEDUPE:ID:{event['event_id']}"):
-        return True
-
-    isin = await _get_isin(event['join_key'], event['source'])
-
-    if isin:
-        if await _check_smart_similarity(isin, event):
-            return True
-    else:
-        semantic_key = f"DEDUPE:SEMANTIC:{event['join_key']}:{event['title'][:15]}"
-        if await redis_client.exists(semantic_key):
-            return True
-        await redis_client.setex(semantic_key, 600, "1")
-
-    await redis_client.setex(f"DEDUPE:ID:{event['event_id']}", 86400, "1")
-    return False
-
-
 async def _is_noise(event):
+    await _refresh_keywords_if_needed()
+
     name = event['clean_name']
     title = (event.get('title') or "").upper()
     summary = (event.get('summary') or "").upper()
@@ -130,17 +133,15 @@ async def _is_noise(event):
             return True, f"DEBT_INSTRUMENT ({scrip})", None
 
     # 3. Bad Keywords
-    bad_keywords = await redis_client.smembers("CONFIG:BAD_KEYWORDS")
-    for kw in bad_keywords:
-        keyword = kw.decode('utf-8').upper() if isinstance(kw, bytes) else kw.upper()
+    for kw in CACHED_BAD_KEYWORDS:
+        keyword = kw.upper()
         if keyword in title or keyword in summary:
             return True, f"BLOCKED: {keyword}", None
 
-    # 4. Shadow Keywords
-    shadow_keywords = await redis_client.smembers("CONFIG:SHADOW_KEYWORDS")
+    # SHADOW_KEYWORDS
     shadow_violation = None
-    for kw in shadow_keywords:
-        keyword = kw.decode('utf-8').upper() if isinstance(kw, bytes) else kw.upper()
+    for kw in CACHED_SHADOW_KEYWORDS:
+        keyword = kw.upper()
         if keyword in title or keyword in summary:
             shadow_violation = keyword
             break
@@ -160,9 +161,6 @@ class EventFilter:
             is_junk, reason, shadow_violation = await _is_noise(event)
             if is_junk:
                 logger.info(f"Filtered: {event['clean_name']} | {reason}")
-                return
-
-            if await _is_duplicate(event):
                 return
 
             if shadow_violation:

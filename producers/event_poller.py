@@ -59,12 +59,17 @@ def _parse_nse_description(description):
 def is_relevant_stock(title):
     if not title: return False
     junk_keywords = [
+        # --- MUTUAL FUNDS & DEBT (Specific) ---
         "MUTUAL FUND", "NAV ", "NET ASSET VALUE",
+        " MF ",
         "FIXED MATURITY PLAN", " FMP ",
         " IDCW ", "FUND OF FUNDS", "INDEX FUND",
+        "EXCHANGE TRADED FUND", " ETF",  # Catches 'Gold ETF', 'Nifty ETF'
         "NON-CONVERTIBLE DEBENTURES", " NCD ", "COMMERCIAL PAPER",
         "INTEREST PAYMENT", "REDEMPTION OF",
         "PORTFOLIO MANAGEMENT",
+
+        # --- ROUTINE COMPLIANCE ---
         "LOSS OF SHARE", "LOST OF SHARE", "DUPLICATE SHARE",
         "CLOSURE OF TRADING", "TRADING WINDOW", "WINDOW CLOSURE",
         "INVESTOR GRIEVANCE", "COMPLIANCE CERTIFICATE",
@@ -73,9 +78,16 @@ def is_relevant_stock(title):
         "TRANSCRIPT OF", "AUDIO RECORDING",
         "CLARIFICATION ON SPURT", "CLARIFICATION ON PRICE",
         "MOVEMENT IN PRICE", "MOVEMENT IN VOLUME",
-        "RATING REAFFIRMED", "RATING WITHDRAWN",
-        "REVIEW OF RATING","FIXED MATURITY PLAN",
-        "DIRECT PLAN","REGULAR PLAN","BENEFIT PLAN"
+
+        # --- SAFE BLOCKS ---
+        "RATING REAFFIRMED", "RATING WITHDRAWN", "REVIEW OF RATING",
+        "DIRECT PLAN", "REGULAR PLAN", "BENEFIT PLAN",  # Fixed Comma Here
+
+        # --- DEBT (Safe Filters Only) ---
+        "ISSUANCE OF DEBT",  # Blocks raising generic debt (usually routine)
+        "DEBT SECURITIES",  # Blocks Bond trading noise
+        "DEBT INSTRUMENT",  # Blocks Bond market noise
+        "SERVICING OF DEBT",  # Routine interest payments
     ]
     title_upper = title.upper()
     if any(keyword in title_upper for keyword in junk_keywords): return False

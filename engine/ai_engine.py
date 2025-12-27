@@ -94,15 +94,30 @@ async def fetch_single_url(session, url):
     text_content = []
     if not url or not url.startswith("http"):
         return None
+
+    # URL Encoding fix
     url = url.strip()
     if " " in url:
         url = urllib.parse.quote(url, safe=":/?&=")
+
     for attempt in range(3):
         try:
             async with session.get(url, timeout=30) as resp:
                 if resp.status == 200:
-                    data = await resp.read()
-                    text = await asyncio.to_thread(_parse_bytes, data)
+                    data = io.BytesIO()
+                    bytes_downloaded = 0
+                    max_size = 10 * 1024 * 1024  # 10 MB Limit
+
+                    # 2. Read in chunks (Safe for RAM)
+                    async for chunk in resp.content.iter_chunked(1024 * 1024):  # 1MB chunks
+                        data.write(chunk)
+                        bytes_downloaded += len(chunk)
+                        if bytes_downloaded > max_size:
+                            logger.warning(f"Truncated large PDF at 10MB: {url}")
+                            break
+                    data.seek(0)
+                    text = await asyncio.to_thread(_parse_bytes, data.read())
+
                     if text:
                         label = "XBRL_DATA" if url.lower().endswith(".xml") else "DOC"
                         text_content.append(f"{label} ({url.split('/')[-1]}):\n{text}")
@@ -115,6 +130,7 @@ async def fetch_single_url(session, url):
                 await asyncio.sleep(2)
             else:
                 logger.warning(f"Fetch Error {url}: {e}")
+
     return "\n\n".join(text_content)
 
 def smart_truncate(text, limit=CONTEXT_CHAR_LIMIT):

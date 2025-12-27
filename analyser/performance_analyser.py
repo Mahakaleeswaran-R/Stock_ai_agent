@@ -50,7 +50,8 @@ class PerformanceAnalyzer:
         await self.resolver.initialize()
         await angel_bridge.initialize()
 
-    async def fetch_intraday_truth(self, ticker: str, trade_date: datetime) -> pd.DataFrame:
+    @staticmethod
+    async def fetch_intraday_truth(ticker: str, trade_date: datetime) -> pd.DataFrame:
         try:
             df = await asyncio.to_thread(
                 angel_bridge.get_historical_candles,
@@ -70,7 +71,6 @@ class PerformanceAnalyzer:
             day_df = df[df.index.date == target_date].copy()
             day_df.sort_index(inplace=True)
 
-            self.market_data_cache[cache_key] = day_df
             return day_df
         except Exception as e:
             logger.warning(f"Data Fetch Error {ticker}: {e}")
