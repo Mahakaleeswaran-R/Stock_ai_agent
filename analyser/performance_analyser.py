@@ -30,7 +30,6 @@ SAFETY_LIMITS = {
 
 class PerformanceAnalyzer:
     def __init__(self):
-        self.market_data_cache = {}
         self.resolver = SymbolResolver()
 
         # Performance Counters
@@ -52,12 +51,6 @@ class PerformanceAnalyzer:
         await angel_bridge.initialize()
 
     async def fetch_intraday_truth(self, ticker: str, trade_date: datetime) -> pd.DataFrame:
-        date_key = trade_date.strftime("%Y-%m-%d")
-        cache_key = f"{ticker}_{date_key}_5m"
-
-        if cache_key in self.market_data_cache:
-            return self.market_data_cache[cache_key]
-
         try:
             df = await asyncio.to_thread(
                 angel_bridge.get_historical_candles,

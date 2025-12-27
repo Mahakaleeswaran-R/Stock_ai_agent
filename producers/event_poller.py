@@ -178,6 +178,7 @@ class RSSEventFetcher:
         self.session = None
         self.output_queue = "QUEUE:NORMALIZED_EVENTS"
         self.is_running = True
+        self.local_seen_cache = set()
 
     async def _get_session(self):
         if self.session is None or self.session.closed:
@@ -188,11 +189,19 @@ class RSSEventFetcher:
         return self.session
 
     async def _dispatch_to_redis(self, event):
+
+        evt_id = event['event_id']
+        if evt_id in self.local_seen_cache:
+            return
+
         dedupe_key = f"POLLER:SEEN:{event['event_id']}"
 
         try:
             is_new = await redis_client.set(dedupe_key, "1", ex=REDIS_EXPIRY, nx=True)
             if is_new:
+                self.local_seen_cache.add(evt_id)
+                if len(self.local_seen_cache) > 2000:
+                    self.local_seen_cache.clear()
                 await redis_client.rpush(self.output_queue, json.dumps(event))
                 logger.info(f"NEW: {event['clean_name']} [{event['source']}]")
         except Exception as e:

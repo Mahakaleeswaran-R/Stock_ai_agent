@@ -101,41 +101,23 @@ class MarketDataService:
 class SymbolResolver:
     def __init__(self):
         self.session = None
-        self.nse_map = {}
-        self.bse_map = {}
-        self.list_map = {}
-        self.session = None
 
     async def initialize(self):
-        tasks = [
-            redis_client.hgetall("CONFIG:ISIN:NSE"),
-            redis_client.hgetall("CONFIG:ISIN:BSE"),
-            redis_client.hgetall("CONFIG:ISIN:SYMBOL")
-        ]
-        results = await asyncio.gather(*tasks)
-
-        def safe_parse(raw_dict):
-            parsed = {}
-            if not raw_dict: return parsed
-
-            for k, v in raw_dict.items():
-                key = k.decode() if isinstance(k, bytes) else k
-                try:
-                    val_str = v.decode() if isinstance(v, bytes) else v
-                    if isinstance(val_str, str) and (val_str.startswith("{") or val_str.startswith("[")):
-                        parsed[key] = json.loads(val_str)
-                    else:
-                        parsed[key] = val_str
-                except:
-                    parsed[key] = v
-            return parsed
-        self.nse_map = safe_parse(results[0])
-        self.bse_map = safe_parse(results[1])
-        self.list_map = safe_parse(results[2])
         self.session = aiohttp.ClientSession(headers={
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         })
-        logger.info(f"Resolver Loaded: {len(self.list_map)} mappings")
+        logger.info("Resolver Ready (On-Demand Redis Mode)")
+
+    @staticmethod
+    async def _get_isin_metadata(isin, exchange):
+        key = f"CONFIG:ISIN:{exchange}"
+        data = await redis_client.hget(key, isin)
+        if data:
+            try:
+                return json.loads(data) if isinstance(data, str) and data.startswith("{") else data
+            except:
+                return data
+        return None
 
     async def _search_yahoo(self, query: str) -> Optional[str]:
         async def fetch(q_str):
@@ -178,19 +160,22 @@ class SymbolResolver:
         return None
 
     async def resolve(self, event: dict) -> Tuple[str, str]:
-        # 1. ISIN Lookup
+        # 1. ISIN Lookup (Direct Redis Fetch)
         isin = event.get('isin')
         if isin:
-            if isin in self.nse_map:
-                data = self.nse_map[isin]
-                if isinstance(data, dict): return data.get("nse_symbol", ""), "NSE"
+            # Check NSE
+            nse_data = await self._get_isin_metadata(isin, "NSE")
+            if nse_data and isinstance(nse_data, dict):
+                return nse_data.get("nse_symbol", ""), "NSE"
 
-            if isin in self.list_map:
-                symbols = self.list_map[isin]
-                if isinstance(symbols, list):
+            # Check Symbol Map
+            symbols_raw = await redis_client.hget("CONFIG:ISIN:SYMBOL", isin)
+            if symbols_raw:
+                symbols = json.loads(symbols_raw)
+                if symbols:
                     nse = next((s for s in symbols if ".NS" in s), None)
                     if nse: return nse, "NSE"
-                    if symbols: return symbols[0], "BSE"
+                    return symbols[0], "BSE"
 
         # 2. Yahoo Search
         raw_name = event.get('clean_name', '').replace(" LIMITED", "").replace(" LTD", "").strip()
@@ -473,7 +458,7 @@ class TechnicalEngine:
         try:
             while True:
                 try:
-                    item = await redis_client.blpop(self.input_queue, timeout=2)
+                    item = await redis_client.blpop(self.input_queue, timeout=30)
                     if item:
                         asyncio.create_task(self.process_event(json.loads(item[1])))
                     else:
