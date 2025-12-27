@@ -4,6 +4,7 @@ import os
 import threading
 from flask import Flask
 
+from config import redis_client
 from producers.event_poller import RSSEventFetcher
 from engine.event_filter import EventFilter
 from engine.ai_engine import AIEngine
@@ -32,12 +33,15 @@ def run_web_server():
 async def start_async_core():
     logger.info("STARTING TRADING SYSTEM CORE...")
 
-    logger.info("Performing Startup ISIN Lookup...")
-    try:
-        await ISINLookupService().run()
-        logger.info("Startup ISIN Lookup Complete.")
-    except Exception as e:
-        logger.error(f"Startup ISIN Failed: {e}")
+    if not await redis_client.exists("CONFIG:ISIN:NSE"):
+        logger.info("Redis empty. Performing Startup ISIN Lookup...")
+        try:
+            await ISINLookupService().run()
+            logger.info("Startup ISIN Lookup Complete.")
+        except Exception as e:
+            logger.error(f"Startup ISIN Failed: {e}")
+    else:
+        logger.info("ISIN Data found in Redis. Skipping startup sync.")
 
     start_scheduler()
 

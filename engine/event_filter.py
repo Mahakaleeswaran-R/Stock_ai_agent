@@ -59,31 +59,51 @@ async def _update_last_event_cache(key, event):
 
 
 async def _check_smart_similarity(isin, current_event):
-    if not isin: return False
-    last_event_key = f"CACHE:LAST_EVENT:{isin}"
+    if not isin:
+        # Fallback: If no ISIN, check using Company Name to prevent duplicates
+        clean_name = current_event['clean_name'].replace(" ", "").upper()
+        last_event_key = f"CACHE:LAST_EVENT:NAME:{clean_name}"
+    else:
+        last_event_key = f"CACHE:LAST_EVENT:{isin}"
+
     last_event_raw = await redis_client.get(last_event_key)
 
     if last_event_raw:
         last_event = json.loads(last_event_raw)
-        last_ts = datetime.fromisoformat(last_event['timestamp'])
-        curr_ts = datetime.fromisoformat(current_event['timestamp'])
-        if abs((curr_ts - last_ts).total_seconds()) > 1200:
-            await _update_last_event_cache(last_event_key, current_event)
-            return False
+
+        # 1. Timestamp Check
+        try:
+            last_ts = datetime.fromisoformat(last_event['timestamp'])
+            curr_ts = datetime.fromisoformat(current_event['timestamp'])
+            # If news is > 20 mins apart, assume it is NEW news (e.g. Outcome followed by Press Release)
+            if abs((curr_ts - last_ts).total_seconds()) > 1200:
+                await _update_last_event_cache(last_event_key, current_event)
+                return False
+        except:
+            pass  # Date parsing error, proceed to text check
+
+        # 2. Text Cleaning
         def clean(t):
             return re.sub(r'[^A-Z0-9]', '', t.upper())
+
         title_a = clean(last_event['title'])
         title_b = clean(current_event['title'])
+
+        # 3. Ratio Calculation
         ratio = difflib.SequenceMatcher(None, title_a, title_b).ratio()
+
         is_dupe = False
         if last_event['source'] == current_event['source']:
+            # Same Exchange: Needs high similarity (e.g. Correction vs Original)
             if ratio > 0.90: is_dupe = True
         else:
-            if ratio > 0.70: is_dupe = True
+            # Cross Exchange (NSE vs BSE): Aggressive check
+            # "Outcome of Board Meeting" (NSE) vs "Board Meeting Outcome" (BSE)
+            if ratio > 0.65: is_dupe = True
 
         if is_dupe:
             logger.info(
-                f"Cross-Source Blocked [{last_event['source']} vs {current_event['source']} | Ratio: {ratio:.2f}]: {current_event['clean_name']}")
+                f"Duplicate Blocked [{last_event['source']} vs {current_event['source']} | R:{ratio:.2f}]: {current_event['clean_name']}")
             return True
     await _update_last_event_cache(last_event_key, current_event)
     return False
@@ -138,6 +158,9 @@ class EventFilter:
             event['status'] = "ACCEPTED"
             event['filtered_at'] = datetime.now().isoformat()
             event['isin'] = await _get_isin(event['join_key'], event['source'])
+
+            if await _check_smart_similarity(event['isin'], event):
+                return
 
             await raw_events.insert_one(event)
 

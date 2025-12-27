@@ -177,13 +177,6 @@ class SymbolResolver:
                     if nse: return nse, "NSE"
                     return symbols[0], "BSE"
 
-        # 2. Yahoo Search
-        raw_name = event.get('clean_name', '').replace(" LIMITED", "").replace(" LTD", "").strip()
-        search_result = await self._search_yahoo(raw_name)
-        if search_result:
-            return search_result, "NSE" if ".NS" in search_result else "BSE"
-
-        # 3. Regex
         clean = re.sub(r'[^A-Z0-9]', '', event.get('clean_name', '').upper())
         return f"{clean}.NS", "NSE"
 
@@ -348,34 +341,49 @@ class TechnicalEngine:
 
     @staticmethod
     def _construct_order(ticker, ai, stats, reason, phase, atr_mult, event_id):
-        limit_price, sl, tp = 0,0,0
+        limit_price, sl, tp = 0, 0, 0
         price = stats['price']
         atr = stats['atr']
         tier = ai.get('tier', 'MODERATE')
 
-        # 1. Determine Tolerance (Slippage protection)
+        # --- FIX 1: Safety Settings ---
+        # Never allow SL to be closer than 1.0% (Prevents "Noise" Stop-outs)
+        min_sl_pct = 0.01
+
+        # 1. Determine Tolerance (Slippage protection for Limit Order)
         gap_tolerance = 0.02 if tier == "EXTREME" else 0.01
 
         # 2. Calculate Limit Price (The Boundary)
         if ai['signal'] == "BUY":
             limit_price = price * (1 + gap_tolerance)
-
         elif ai['signal'] == "SELL":
             limit_price = price * (1 - gap_tolerance)
 
         # 3. Order Type
         order_type = "LIMIT"
 
-        # 4. Dynamic Stops & Targets
+        # 4. Dynamic Stops & Targets (The Critical Fix)
         base_mult = atr_mult
         final_mult = base_mult + 0.5 if tier == "EXTREME" else base_mult
 
+        # Calculate the raw distance based on Volatility (ATR)
+        raw_sl_distance = atr * final_mult
+
+        # Calculate the minimum safety distance (1% of price)
+        min_safety_distance = price * min_sl_pct
+
+        # Use the LARGER distance (Safest option)
+        actual_sl_distance = max(raw_sl_distance, min_safety_distance)
+
+        # Recalculate TP to maintain Risk:Reward Ratio (1:2.5) based on actual SL
+        actual_tp_distance = actual_sl_distance * 2.5
+
         if ai['signal'] == "BUY":
-            sl = price - (atr * final_mult)
-            tp = price + (atr * final_mult * 2.5)
+            sl = price - actual_sl_distance
+            tp = price + actual_tp_distance
         elif ai['signal'] == "SELL":
-            sl = price + (atr * final_mult)
-            tp = price - (atr * final_mult * 2.5)
+            sl = price + actual_sl_distance
+            tp = price - actual_tp_distance
 
         return {
             "event_id": event_id,
