@@ -186,7 +186,7 @@ class EventFilter:
     async def run(self):
         logger.info("Event Filter Active...")
         while True:
-            item = await redis_client.blpop(self.input_queue, timeout=5)
+            item = await redis_client.blpop(self.input_queue, timeout=15)
             if item:
                 await self.process_event(item[1])
             else:
