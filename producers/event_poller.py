@@ -59,11 +59,22 @@ def _parse_nse_description(description):
 def is_relevant_stock(title):
     if not title: return False
     junk_keywords = [
-        "MUTUAL FUND", "MF", "ETF","SENSEX"
-        "FIXED MATURITY PLAN", "FMP", "SERIES", "PLAN", "OPTION",
-        "DIRECT PLAN", "REGULAR PLAN", "IDCW",
-        "NAV", "NET ASSET VALUE", "SCHEME", "PORTFOLIO", "DEBT",
-        "GILT", "FUND OF FUNDS", "INDEX FUND"
+        "MUTUAL FUND", "NAV ", "NET ASSET VALUE",
+        "FIXED MATURITY PLAN", " FMP ",
+        " IDCW ", "FUND OF FUNDS", "INDEX FUND",
+        "NON-CONVERTIBLE DEBENTURES", " NCD ", "COMMERCIAL PAPER",
+        "INTEREST PAYMENT", "REDEMPTION OF",
+        "PORTFOLIO MANAGEMENT",
+        "LOSS OF SHARE", "LOST OF SHARE", "DUPLICATE SHARE",
+        "CLOSURE OF TRADING", "TRADING WINDOW", "WINDOW CLOSURE",
+        "INVESTOR GRIEVANCE", "COMPLIANCE CERTIFICATE",
+        "NEWSPAPER PUBLICATION", "POSTAL BALLOT", "E-VOTING",
+        "REGULATION 74", "REGULATION 76", "REGULATION 40",
+        "TRANSCRIPT OF", "AUDIO RECORDING",
+        "CLARIFICATION ON SPURT", "CLARIFICATION ON PRICE",
+        "MOVEMENT IN PRICE", "MOVEMENT IN VOLUME",
+        "RATING REAFFIRMED", "RATING WITHDRAWN",
+        "REVIEW OF RATING",
     ]
     title_upper = title.upper()
     if any(keyword in title_upper for keyword in junk_keywords): return False
@@ -200,7 +211,7 @@ class RSSEventFetcher:
             is_new = await redis_client.set(dedupe_key, "1", ex=REDIS_EXPIRY, nx=True)
             if is_new:
                 self.local_seen_cache.add(evt_id)
-                if len(self.local_seen_cache) > 2000:
+                if len(self.local_seen_cache) > 10000:
                     self.local_seen_cache.clear()
                 await redis_client.rpush(self.output_queue, json.dumps(event))
                 logger.info(f"NEW: {event['clean_name']} [{event['source']}]")
