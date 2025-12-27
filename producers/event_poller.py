@@ -88,6 +88,26 @@ def is_relevant_stock(title):
         "DEBT SECURITIES",  # Blocks Bond trading noise
         "DEBT INSTRUMENT",  # Blocks Bond market noise
         "SERVICING OF DEBT",  # Routine interest payments
+
+        # --- MISSING MF VARIATIONS (From your logs) ---
+        "MUTUAL F",  # Catches "ADITYA BIRLA SUN LIFE MUTUAL F" (Truncated title)
+        "FIXED TERM PLAN",  # Catches "BIRLA SUN LIFE FIXED TERM PLAN"
+        " FTP ",  # Short for Fixed Term Plan
+        "INTERVAL INCOME FUND",  # Catches "INTERVAL INCOME FUND"
+        "RESURGENT INDIA FUND",  # Catches the specific scheme in your logs
+        "DUAL ADVANTAGE FUND",  # Catches the "Series 2" fund in your logs
+
+        # --- GENERIC MF TERMS (Safe to block) ---
+        "GROWTH OPTION",  # MF Terminology (Safe: Companies don't call growth "Growth Option")
+        "DIVIDEND PAYOUT",  # MF Terminology
+        "DIVIDEND SWEEP",  # MF Terminology
+        "DIVIDEND REINVESTMENT",  # MF Terminology
+
+        # --- DEBT/BONDS (Safe filters) ---
+        "ISSUANCE OF DEBT",  # Blocks raising debt (Routine)
+        "DEBT SECURITIES",  # Blocks Bond trading
+        "DEBT INSTRUMENT",  # Blocks Bond market
+        "SERVICING OF DEBT",  # Routine interest payments
     ]
     title_upper = title.upper()
     if any(keyword in title_upper for keyword in junk_keywords): return False
