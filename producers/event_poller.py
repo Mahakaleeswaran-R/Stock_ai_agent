@@ -5,6 +5,7 @@ import logging
 import asyncio
 import re
 import json
+from collections import OrderedDict
 from datetime import datetime, timezone
 from dateutil import parser as date_parser
 from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
@@ -56,7 +57,8 @@ def _parse_nse_description(description):
         return parts[0].strip(), parts[1].strip()
     return description.strip(), "General"
 
-def is_relevant_stock(title,summary=""):
+
+def is_relevant_stock(title, summary=""):
     if not title: return False
     junk_keywords = [
         # --- MUTUAL FUNDS & DEBT (Specific) ---
@@ -144,17 +146,13 @@ def _extract_doc_urls(entry) -> list:
 
 def _generate_id(source, entry, scrip_code=None):
     doc_urls = _extract_doc_urls(entry)
-
     # Strategy 1: PDF Filename + Identifier
     if doc_urls:
         filename = doc_urls[0].split('/')[-1]
-        # Use ScripCode or a Hash of the Title to ensure uniqueness if filename is generic (e.g. "outcome.pdf")
         if scrip_code:
             unique_identifier = scrip_code
         else:
-            # Fallback: Hash the title to get a short unique string
             unique_identifier = hashlib.md5(entry.get('title', '').encode()).hexdigest()[:8]
-
         return f"{source}_{unique_identifier}_{filename}"
 
     # Strategy 2: GUID
@@ -222,37 +220,49 @@ class RSSEventFetcher:
         self.session = None
         self.output_queue = "QUEUE:NORMALIZED_EVENTS"
         self.is_running = True
-        self.local_seen_cache = set()
+
+        # --- STATE OPTIMIZATION ---
+        self.last_modified_times = {}  # For NSE (Headers)
+        self.last_content_hashes = {}  # For BSE (Content Fingerprint)
+        self.local_seen_cache = OrderedDict()  # Rolling Window Cache
+        self.CACHE_LIMIT = 10000
 
     async def _get_session(self):
         if self.session is None or self.session.closed:
-            # Aggressive timeout for polling
             timeout = aiohttp.ClientTimeout(total=15, connect=5)
             connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300, ssl=False)
             self.session = aiohttp.ClientSession(connector=connector, headers=HEADERS, timeout=timeout)
         return self.session
 
     async def _dispatch_to_redis(self, event):
-
         if event['source'] == 'BSE':
             scrip = str(event.get('scrip_code', ''))
             if scrip and (scrip.startswith('9') or scrip.startswith('8') or scrip.startswith('7')):
                 return
 
         evt_id = event['event_id']
+
+        # 1. RAM CHECK
         if evt_id in self.local_seen_cache:
+            self.local_seen_cache.move_to_end(evt_id)
             return
 
         dedupe_key = f"POLLER:SEEN:{event['event_id']}"
 
         try:
+            # 2. REDIS CHECK
             is_new = await redis_client.set(dedupe_key, "1", ex=REDIS_EXPIRY, nx=True)
+
             if is_new:
-                self.local_seen_cache.add(evt_id)
-                if len(self.local_seen_cache) > 10000:
-                    self.local_seen_cache.clear()
-                await redis_client.rpush(self.output_queue, json.dumps(event))
                 logger.info(f"NEW: {event['clean_name']} [{event['source']}]")
+                self.local_seen_cache[evt_id] = True
+                await redis_client.rpush(self.output_queue, json.dumps(event))
+            else:
+                self.local_seen_cache[evt_id] = True
+
+            if len(self.local_seen_cache) > self.CACHE_LIMIT:
+                self.local_seen_cache.popitem(last=False)
+
         except Exception as e:
             logger.error(f"Redis Dispatch Error: {e}")
 
@@ -263,21 +273,54 @@ class RSSEventFetcher:
     )
     async def fetch_one(self, source, url):
         session = await self._get_session()
+
+        # --- STRATEGY 1: IF-MODIFIED-SINCE (Works for NSE) ---
+        req_headers = {}
+        if url in self.last_modified_times:
+            req_headers['If-Modified-Since'] = self.last_modified_times[url]
+
         try:
-            async with session.get(url) as response:
-                if response.status != 200:
-                    logger.warning(f"{source} Down: {response.status}")
+            async with session.get(url, headers=req_headers) as response:
+
+                # [NSE] Bandwidth Saver
+                if response.status == 304:
+                    # Log optimization success
+                    logger.info(f"[{source}] 304 Not Modified | Skipping Parse")
                     return
-                content = await response.read()
-                feed = await asyncio.to_thread(feedparser.parse, content)
-                if feed.bozo:
-                    logger.debug(f"{source} Malformed XML received (Bozo exception)")
-                if not feed.entries:
+
+                if response.status == 200:
+                    # Update Timestamp for next time
+                    last_mod = response.headers.get('Last-Modified')
+                    if last_mod:
+                        self.last_modified_times[url] = last_mod
+
+                    content = await response.read()
+
+                    # --- STRATEGY 2: CONTENT HASHING (Works for BSE) ---
+                    # Even if BSE sends 200 OK, we calculate the MD5 hash of the file.
+                    # If the hash is same as last time, the file hasn't changed.
+                    # We SKIP parsing entirely. Zero CPU usage.
+                    current_hash = hashlib.md5(content).hexdigest()
+                    if self.last_content_hashes.get(url) == current_hash:
+                        # Log optimization success
+                        logger.info(f"[{source}] MD5 Hash Match | Skipping Parse")
+                        return
+
+                    # New content detected! Update hash and parse.
+                    self.last_content_hashes[url] = current_hash
+                    # logger.info(f"[{source}] New Content Detected (Hash: {current_hash[:8]}...)")
+
+                    feed = await asyncio.to_thread(feedparser.parse, content)
+                    if not feed.entries:
+                        return
+
+                    for entry in reversed(feed.entries):
+                        parsed = parse_entry(source, entry)
+                        if parsed:
+                            await self._dispatch_to_redis(parsed)
                     return
-                for entry in reversed(feed.entries):
-                    parsed = parse_entry(source, entry)
-                    if parsed:
-                        await self._dispatch_to_redis(parsed)
+
+                logger.warning(f"{source} Down: {response.status}")
 
         except Exception as e:
             logger.error(f"Fetch Error ({source}): {str(e)}")
@@ -292,9 +335,9 @@ class RSSEventFetcher:
                 await asyncio.gather(*tasks)
             except Exception as e:
                 logger.critical(f"Global Poller Loop Error: {e}", exc_info=True)
+
             elapsed = (datetime.now() - start_time).total_seconds()
             sleep_time = max(0.5, POLL_INTERVAL_SECONDS - elapsed)
-            logger.info(f"Sleeping {sleep_time:.2f}s...")
             await asyncio.sleep(sleep_time)
 
     async def close(self):

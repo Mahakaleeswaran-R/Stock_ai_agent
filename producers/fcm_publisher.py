@@ -38,12 +38,15 @@ async def send_notification(signal):
         catalyst = ai_data.get('catalyst', 'Technical Signal')
         tier = ai_data.get('tier', 'MODERATE')
 
+        source = signal.get('source', 'NSE')
+
         emoji = "🐂" if side == "BUY" else "🐻"
-        notif_title = f"{emoji} {catalyst}"
-        notif_body = f"{tier} {side}: {symbol} @ ₹{entry}"
+        notif_title = f"{emoji} {side} {symbol} [{source}]"
+        notif_body = f"Entry: {entry}\nTier: {tier}\nReason: {catalyst}"
 
         data_payload = {
             "click_action": "FLUTTER_NOTIFICATION_CLICK",
+            "source":str(source),
             "symbol": str(symbol),
             "signal": str(side),
             "entry": str(entry),

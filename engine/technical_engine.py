@@ -119,46 +119,6 @@ class SymbolResolver:
                 return data
         return None
 
-    async def _search_yahoo(self, query: str) -> Optional[str]:
-        async def fetch(q_str):
-            clean_q = re.sub(r'[&.-]', ' ', q_str)
-            clean_q = re.sub(r'\s+', ' ', clean_q).strip()
-
-            url = "https://query2.finance.yahoo.com/v1/finance/search"
-            params = {"q": clean_q, "quotesCount": 10, "newsCount": 0, "enableFuzzyQuery": "false"}
-
-            try:
-                async with self.session.get(url, params=params, timeout=5) as resp:
-                    if resp.status != 200: return None
-                    data = await resp.json()
-
-                    if "quotes" in data and len(data["quotes"]) > 0:
-                        for quote in data["quotes"]:
-
-                            quote_type = quote.get("quoteType", "EQUITY")
-                            if quote_type not in ["EQUITY", "INDEX", "CURRENCY"]:
-                                continue
-
-                            symbol = quote.get("symbol", "")
-                            if ".NS" in symbol or ".BO" in symbol:
-                                logger.info(f"Yahoo Found: '{q_str}' -> {symbol}")
-                                return symbol
-            except Exception as e:
-                logger.warning(f"Search Error: {e}")
-            return None
-
-        result = await fetch(query)
-        if result: return result
-
-        words = query.split()
-        if len(words) > 2:
-            short_query = " ".join(words[:2])
-            logger.info(f"Retrying Yahoo with shorter query: '{short_query}'")
-            result = await fetch(short_query)
-            if result: return result
-
-        return None
-
     async def resolve(self, event: dict) -> Tuple[str, str]:
         # 1. ISIN Lookup (Direct Redis Fetch)
         isin = event.get('isin')
@@ -340,7 +300,7 @@ class TechnicalEngine:
         return "EXECUTED", f"VALID_{phase}"
 
     @staticmethod
-    def _construct_order(ticker, ai, stats, reason, phase, atr_mult, event_id):
+    def _construct_order(ticker, ai, stats, reason, phase, atr_mult, event_id,source):
         limit_price, sl, tp = 0, 0, 0
         price = stats['price']
         atr = stats['atr']
@@ -390,6 +350,7 @@ class TechnicalEngine:
 
         return {
             "event_id": event_id,
+            "source": source,
             "symbol": ticker,
             "signal": ai['signal'],
             "order_type": order_type,
@@ -458,7 +419,8 @@ class TechnicalEngine:
             signal = self._construct_order(
                 ticker, ai, stats, reason, phase,
                 atr_mult=self.atr_multiplier,
-                event_id=event.get('event_id')
+                event_id=event.get('event_id'),
+                source=event.get('source', 'SRC_ERR')
             )
             await redis_client.rpush(self.output_queue, json.dumps(signal, default=json_serial))
             await trade_signals.insert_one(signal)
