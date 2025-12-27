@@ -56,7 +56,7 @@ def _parse_nse_description(description):
         return parts[0].strip(), parts[1].strip()
     return description.strip(), "General"
 
-def is_relevant_stock(title):
+def is_relevant_stock(title,summary=""):
     if not title: return False
     junk_keywords = [
         # --- MUTUAL FUNDS & DEBT (Specific) ---
@@ -109,9 +109,9 @@ def is_relevant_stock(title):
         "DEBT INSTRUMENT",  # Blocks Bond market
         "SERVICING OF DEBT",  # Routine interest payments
     ]
-    title_upper = title.upper()
-    if any(keyword in title_upper for keyword in junk_keywords): return False
-    if "-ETF" in title_upper or " ETF" in title_upper: return False
+    text_to_check = (title + " " + summary).upper()
+    if any(keyword in text_to_check for keyword in junk_keywords): return False
+    if "-ETF" in text_to_check or " ETF" in text_to_check: return False
     return True
 
 
@@ -172,11 +172,11 @@ def _generate_id(source, entry, scrip_code=None):
 def parse_entry(source, entry):
     try:
         raw_title = entry.get("title", "")
+        summary_raw = entry.get("summary", "") or entry.get("description", "")
 
-        if not is_relevant_stock(raw_title):
+        if not is_relevant_stock(raw_title,summary_raw):
             return None
 
-        summary_raw = entry.get("summary", "") or entry.get("description", "")
         scrip_code = None
         category = "General"
         raw_company_name = raw_title

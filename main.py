@@ -21,18 +21,22 @@ logger = logging.getLogger("STOCK_AGENT")
 
 app = Flask(__name__)
 
+
 @app.route('/')
 def home():
     return "Stock Trading Agent is RUNNING (Async Core Active)"
+
 
 def run_web_server():
     port = int(os.environ.get("PORT", 5000))
     logger.info(f"Starting Web Server on port {port}...")
     app.run(host='0.0.0.0', port=port)
 
+
 async def start_async_core():
     logger.info("STARTING TRADING SYSTEM CORE...")
 
+    # 1. Startup Checks
     if not await redis_client.exists("CONFIG:ISIN:NSE"):
         logger.info("Redis empty. Performing Startup ISIN Lookup...")
         try:
@@ -45,20 +49,34 @@ async def start_async_core():
 
     start_scheduler()
 
+    # 2. Initialize Engines
     poller = RSSEventFetcher()
     ev_filter = EventFilter()
     ai_engine = AIEngine()
     tech_engine = TechnicalEngine()
 
+
+    async def safe_run(name, func):
+        logger.info(f"{name} Starting...")
+        while True:
+            try:
+                await func()
+            except asyncio.CancelledError:
+                logger.info(f"{name} Stopped.")
+                break
+            except Exception as e:
+                logger.error(f"CRASH in {name}: {e}. Restarting in 5s...")
+                await asyncio.sleep(5)
+
     tasks = [
-        asyncio.create_task(poller.run_loop(), name="Poller"),
-        asyncio.create_task(ev_filter.run(), name="Filter"),
-        asyncio.create_task(ai_engine.run(), name="AI_Engine"),
-        asyncio.create_task(tech_engine.run(), name="Tech_Engine"),
-        asyncio.create_task(run_fcm(), name="FCM_Publisher")
+        asyncio.create_task(safe_run("Poller", poller.run_loop)), 
+        asyncio.create_task(safe_run("Filter", ev_filter.run)), 
+        asyncio.create_task(safe_run("AI_Engine", ai_engine.run)), 
+        asyncio.create_task(safe_run("Tech_Engine", tech_engine.run)), 
+        asyncio.create_task(safe_run("FCM_Publisher", run_fcm)) 
     ]
 
-    logger.info(f"All {len(tasks)} Engines Running.")
+    logger.info(f"All {len(tasks)} Engines Running in Safe Mode.")
 
     try:
         await asyncio.gather(*tasks)
@@ -71,13 +89,16 @@ async def start_async_core():
         for task in tasks:
             if not task.done():
                 task.cancel()
-        
+
+        # Wait for graceful shutdown
         await asyncio.gather(*tasks, return_exceptions=True)
-        
+
+        # Close connections
         if hasattr(poller, 'close'):
             await poller.close()
-            
+
         logger.info("System Shutdown Complete.")
+
 
 def run_async_loop_in_thread():
     loop = asyncio.new_event_loop()
@@ -87,11 +108,12 @@ def run_async_loop_in_thread():
     finally:
         loop.close()
 
+
 if __name__ == "__main__":
     try:
         t = threading.Thread(target=run_async_loop_in_thread, daemon=True)
         t.start()
         run_web_server()
-        
+
     except KeyboardInterrupt:
         logger.info("Manual Stop Triggered")

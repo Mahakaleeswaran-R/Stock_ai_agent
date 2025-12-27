@@ -346,7 +346,7 @@ class TechnicalEngine:
         atr = stats['atr']
         tier = ai.get('tier', 'MODERATE')
 
-        # --- FIX 1: Safety Settings ---
+        # --- Safety Settings ---
         # Never allow SL to be closer than 1.0% (Prevents "Noise" Stop-outs)
         min_sl_pct = 0.01
 
@@ -385,6 +385,9 @@ class TechnicalEngine:
             sl = price + actual_sl_distance
             tp = price - actual_tp_distance
 
+        now_ist = datetime.now(IST)
+        naive_ist_time = now_ist.replace(tzinfo=None)
+
         return {
             "event_id": event_id,
             "symbol": ticker,
@@ -401,7 +404,7 @@ class TechnicalEngine:
                 "status": reason
             },
             "phase": phase,
-            "timestamp": datetime.now(IST)
+            "timestamp": naive_ist_time
         }
 
     @staticmethod
