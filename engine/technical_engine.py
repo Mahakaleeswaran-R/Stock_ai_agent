@@ -382,13 +382,16 @@ class TechnicalEngine:
             "symbol": ticker,
             "signal": ai['signal'],
             "order_type": order_type,
-            "entry_ref": round(price, 2),
+            "entry": round(price, 2),
             "limit_price": round(limit_price, 2),
             "stop_loss": round(sl, 2),
             "take_profit": round(tp, 2),
             "quantity_score": 10 if tier == "EXTREME" else 5,
-            "reason": reason,
-            "catalyst": ai.get('catalyst'),
+            "ai_analysis": ai,
+            "instructions": {
+                "rsi": round(stats.get('rsi', 0), 2),
+                "status": reason
+            },
             "phase": phase,
             "timestamp": datetime.now(IST)
         }
