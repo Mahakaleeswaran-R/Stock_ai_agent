@@ -90,19 +90,33 @@ class AngelBridge:
         to_date = datetime.now()
         from_date = to_date - timedelta(days=days)
 
-        try:
-            params = {
-                "exchange": exch,
-                "symboltoken": token,
-                "interval": interval,
-                "fromdate": from_date.strftime("%Y-%m-%d %H:%M"),
-                "todate": to_date.strftime("%Y-%m-%d %H:%M")
-            }
+        params = {
+            "exchange": exch,
+            "symboltoken": token,
+            "interval": interval,
+            "fromdate": from_date.strftime("%Y-%m-%d %H:%M"),
+            "todate": to_date.strftime("%Y-%m-%d %H:%M")
+        }
 
+        try:
             response = self.api.getCandleData(params)
+            if response and response.get('errorCode') == 'AG8001':
+                logger.warning("Session Expired (AG8001). Re-logging in...")
+                try:
+                    self.api = SmartConnect(api_key=ANGEL_API_KEY)
+                    totp_val = pyotp.TOTP(ANGEL_TOTP_KEY).now()
+                    data = self.api.generateSession(ANGEL_CLIENT_ID, ANGEL_PIN, totp_val)
+                    if not data['status']:
+                        raise Exception(data['message'])
+                    self.last_login_time = datetime.now()
+                    logger.info("Re-login Successful. Retrying data fetch...")
+                    response = self.api.getCandleData(params)
+                except Exception as login_err:
+                    logger.error(f"Auto-Re-login Failed: {login_err}")
+                    return None
 
             if not response or not response.get('status') or not response.get('data'):
-                logger.warning(f"No Candle Data for {symbol}")
+                logger.warning(f"No Candle Data for {symbol} (Response: {response})")
                 return None
 
             df = pd.DataFrame(response['data'], columns=['Date', 'Open', 'High', 'Low', 'Close', 'Volume'])
