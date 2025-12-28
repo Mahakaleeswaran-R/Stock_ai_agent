@@ -3,6 +3,7 @@ import pyotp
 import requests
 import logging
 import asyncio
+import pytz
 from datetime import datetime, timedelta
 from SmartApi import SmartConnect
 from tenacity import retry, stop_after_attempt, wait_fixed
@@ -11,7 +12,7 @@ from config import ANGEL_API_KEY, ANGEL_TOTP_KEY, ANGEL_CLIENT_ID, ANGEL_PIN
 
 logger = logging.getLogger("ANGEL_BRIDGE")
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-
+IST = pytz.timezone('Asia/Kolkata')
 
 
 class AngelBridge:
@@ -41,7 +42,7 @@ class AngelBridge:
                 data = self.api.generateSession(ANGEL_CLIENT_ID, ANGEL_PIN, totp_val)
                 if data['status'] is False:
                     raise Exception(f"Login Failed: {data['message']}")
-                self.last_login_time = datetime.now()
+                self.last_login_time = datetime.now(IST)
                 logger.info("Angel One Login Successful")
             except Exception as e:
                 logger.error(f"Angel Login Critical Error: {e}")
@@ -52,23 +53,46 @@ class AngelBridge:
                 self.token_map.clear()
 
                 url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
-                scrip_data = await asyncio.to_thread(requests.get, url)
-                scrip_data = scrip_data.json()
+                max_retries = 3
+                for attempt in range(1, max_retries + 1):
+                    try:
+                        logger.info(f"Downloading Scrip Master... (Attempt {attempt}/{max_retries})")
+                        scrip_data = await asyncio.to_thread(
+                            lambda: requests.get(url, timeout=30).json()
+                        )
 
-                for scrip in scrip_data:
-                    symbol = scrip['symbol']
-                    token = scrip['token']
-                    exch = scrip['exch_seg']
-                    if exch == 'NSE' and '-EQ' in symbol:
-                        clean_sym = symbol.replace('-EQ', '') + ".NS"
-                        self.token_map[clean_sym] = {"token": token, "exch": "NSE"}
-                    elif exch == 'BSE':
-                        clean_sym = symbol + ".BO"
-                        self.token_map[clean_sym] = {"token": token, "exch": "BSE"}
-                self.token_map['NIFTY'] = {"token": "99926000", "exch": "NSE"}
-                self.token_map['BANKNIFTY'] = {"token": "99926009", "exch": "NSE"}
+                        count = 0
+                        for scrip in scrip_data:
+                            exch = scrip.get('exch_seg')
+                            symbol = scrip.get('symbol')
+                            token = scrip.get('token')
 
-                logger.info(f"Token Map Updated: {len(self.token_map)} Scrips")
+                            if exch == 'NSE' and '-EQ' in symbol:
+                                clean_sym = symbol.replace('-EQ', '') + ".NS"
+                                self.token_map[clean_sym] = {"token": token, "exch": "NSE"}
+                                count += 1
+                            elif exch == 'BSE':
+                                clean_sym = symbol + ".BO"
+                                self.token_map[clean_sym] = {"token": token, "exch": "BSE"}
+                                count += 1
+
+                        self.token_map['NIFTY'] = {"token": "99926000", "exch": "NSE"}
+                        self.token_map['BANKNIFTY'] = {"token": "99926009", "exch": "NSE"}
+
+                        logger.info(f"Token Map Updated: {count} Scrips Loaded")
+                        return
+
+                    except requests.exceptions.Timeout:
+                        logger.warning(f"Timeout on attempt {attempt}. Retrying...")
+                    except MemoryError:
+                        logger.critical("Server Out of RAM! Cannot load Scrip Master.")
+                        raise  # Fatal
+                    except Exception as e:
+                        logger.error(f"Attempt {attempt} failed: {e}")
+
+                    await asyncio.sleep(2)
+
+                raise Exception("CRITICAL FAILURE: Could not load Scrip Master after 3 attempts.")
 
 
     def get_token_info(self, symbol):

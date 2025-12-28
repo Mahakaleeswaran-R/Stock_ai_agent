@@ -4,13 +4,15 @@ import logging
 import asyncio
 import re
 from datetime import datetime
-
+import pytz
 from bson import ObjectId
 
 from config import redis_client, raw_events
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("EVENT_FILTER")
+
+IST = pytz.timezone('Asia/Kolkata')
 
 CACHED_BAD_KEYWORDS = set()
 CACHED_SHADOW_KEYWORDS = set()
@@ -156,7 +158,7 @@ class EventFilter:
                 logger.info(f"Shadow Match: {event['clean_name']} (Allowed)")
 
             event['status'] = "ACCEPTED"
-            event['filtered_at'] = datetime.now().isoformat()
+            event['filtered_at'] = datetime.now(IST).isoformat()
             event['isin'] = await _get_isin(event['join_key'], event['source'])
 
             if await _check_smart_similarity(event['isin'], event):

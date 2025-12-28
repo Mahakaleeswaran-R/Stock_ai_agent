@@ -1,6 +1,4 @@
-import asyncio
 import logging
-import signal as sgnl
 from datetime import datetime, timedelta
 import pytz
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -23,7 +21,7 @@ IST = pytz.timezone('Asia/Kolkata')
 async def job_data_cleanup():
     logger.info("STARTING NIGHTLY STORAGE PURGE...")
     try:
-        retention_cutoff = datetime.now() - timedelta(hours=7)
+        retention_cutoff = datetime.now(IST) - timedelta(days=7)
         res_events = await raw_events.delete_many({
             "timestamp": {"$lt": retention_cutoff.isoformat()}
         })
@@ -63,25 +61,25 @@ async def job_performance_analyser():
     try:
         service = PerformanceAnalyzer()
         await service.run()
-        logger.info("performance analysis Job Completed")
+        logger.info("Performance Analysis Job Completed")
     except Exception as e:
-        logger.error(f"performance analysis Job: {e}")
+        logger.error(f"Performance Analysis Job: {e}")
 
 
 def start_scheduler():
     scheduler = AsyncIOScheduler(timezone=IST)
 
-    # 1. ISIN Sync: 08:30 AM
-    scheduler.add_job(job_isin_update, CronTrigger(hour=8, minute=30))
+    # ISIN Sync: 08:30 AM IST
+    scheduler.add_job(job_isin_update, CronTrigger(hour=8, minute=30, timezone=IST))
 
-    # 2. Performance Analyzer: 04:30 PM
-    scheduler.add_job(job_performance_analyser, CronTrigger(hour=16, minute=30))
+    # Performance Analyzer: 04:30 PM IST
+    scheduler.add_job(job_performance_analyser, CronTrigger(hour=16, minute=30, timezone=IST))
 
-    # 3. Feedback Layer: 08:00 PM
-    scheduler.add_job(run_feedback_job, CronTrigger(hour=20, minute=0))
+    # Feedback Layer: 08:00 PM IST
+    scheduler.add_job(run_feedback_job, CronTrigger(hour=20, minute=0, timezone=IST))
 
-    # 4. Cleanup: 11:30 PM
-    scheduler.add_job(job_data_cleanup, CronTrigger(hour=23, minute=30))
+    # Cleanup: 11:30 PM IST
+    scheduler.add_job(job_data_cleanup, CronTrigger(hour=23, minute=30, timezone=IST))
 
     scheduler.start()
     logger.info("Scheduler Active")
