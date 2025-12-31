@@ -294,12 +294,11 @@ class RSSEventFetcher:
                 is_new = await redis_client.set(
                     f"POLLER:SEEN:{key}", "1", ex=REDIS_EXPIRY, nx=True
                 )
+                self.local_seen[key] = time.time()
                 if not is_new:
                     continue
 
-                self.local_seen[key] = time.time()
                 await redis_client.rpush(self.output_queue, json.dumps(evt))
-
                 logger.info(f"New Event [{source}]: {evt['clean_name']}")
                 new_count += 1
 
