@@ -317,13 +317,28 @@ class AIEngine:
         return self.session
 
     async def call_ai(self, prompt, temperature):
-        # Retry Logic embedded here or use tenacity
-        return await asyncio.to_thread(
-            self.client.models.generate_content,
-            model=MODEL_NAME,
-            contents=prompt,
-            config=types.GenerateContentConfig(temperature=temperature)
-        )
+        max_attempts = 4
+        delay = 20
+        for attempt in range(1, max_attempts + 1):
+            try:
+                logger.info(f"Calling ai (Attempt {attempt})...")
+                return await asyncio.to_thread(
+                    self.client.models.generate_content,
+                    model=MODEL_NAME,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(temperature=temperature)
+                )
+            except Exception as e:
+                err = str(e).upper()
+                retriable = ("429" in err or "RESOURCE_EXHAUSTED" in err or "503" in err)
+                if not retriable:
+                    logger.error(f"NON-RETRIABLE AI ERROR: {e}")
+                    return None
+                logger.warning(f"AI RATE LIMIT (Attempt {attempt}). Sleeping {delay}s")
+                await asyncio.sleep(delay)
+                delay *= 2
+        return None
+
 
     async def analyze(self, event):
         session = await self.get_session()
@@ -351,7 +366,7 @@ class AIEngine:
 
         analyst = validate_analysis(analyst)
         if not analyst: return None
-        if analyst["signal"] in ("BUY", "SELL") and analyst["confidence"] < 0.65:
+        if analyst["signal"] in ("BUY", "SELL") and analyst["confidence"] < config.AI_MIN_CONFIDENCE:
             analyst["signal"] = "HOLD"
             analyst["tier"] = "NEUTRAL"
             analyst["confidence"] = 0.0
@@ -449,7 +464,6 @@ class AIEngine:
                 })
 
                 if result["signal"] != "HOLD":
-                    # [FIXED] Attach AI Analysis & Summary to Event
                     event["ai_analysis"] = result
                     event["ai_summary"] = build_ai_summary(event, result)
 
