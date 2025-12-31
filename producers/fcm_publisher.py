@@ -164,7 +164,7 @@ async def run():
     while True:
         try:
             # Blocking Pop from Redis
-            item = await redis_client.blpop("QUEUE:TRADE_SIGNALS", timeout=30)
+            item = await redis_client.blpop("QUEUE:TRADE_SIGNALS", timeout=60)
 
             if not item:
                 await asyncio.sleep(0.1)

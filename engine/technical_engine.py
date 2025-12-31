@@ -380,7 +380,7 @@ class TechnicalEngine:
     async def run(self):
         await angel_bridge.initialize()
         while True:
-            item = await redis_client.blpop("QUEUE:AI_SIGNALS", timeout=5)
+            item = await redis_client.blpop("QUEUE:AI_SIGNALS", timeout=60)
             if item:
                 await self.process(json.loads(item[1]))
             else:
