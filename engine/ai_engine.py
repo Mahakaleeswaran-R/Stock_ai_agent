@@ -20,6 +20,7 @@ MODEL_NAME = "gemma-3-27b-it"
 RATE_LIMIT_SECONDS = 5.0
 CONTEXT_CHAR_LIMIT = 20_000
 MAX_PDF_SIZE = 7 * 1024 * 1024
+ENGINE_MODE = "LIVE"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0",
@@ -27,55 +28,60 @@ HEADERS = {
     "Connection": "keep-alive"
 }
 
-# Configure logging to show everything
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger("AI_ENGINE")
 
 
 def extract_json(text: str):
     try:
-        fenced = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL)
-        if fenced:
-            return json.loads(fenced.group(1))
-        block = re.search(r"(\{[\s\S]*?\})", text)
-        if block:
-            return json.loads(block.group(1))
-    except:
+        fenced = re.search(r"```json\s*(\{[\s\S]*?\})\s*```", text)
+        if not fenced:
+            return None
+        return json.loads(fenced.group(1))
+    except Exception:
         return None
-    return None
 
-
-def repair_json(text: str):
-    try:
-        text = re.sub(r"```json|```", "", text).strip()
-        text = re.sub(r",\s*}", "}", text)
-        text = re.sub(r",\s*]", "]", text)
-        return json.loads(text)
-    except:
-        return None
 
 
 def validate_analysis(obj):
-    if not isinstance(obj, dict):
-        return None
+    if not isinstance(obj, dict): return None
     required = {"signal", "tier", "confidence", "catalyst"}
-    if not required.issubset(obj):
-        return None
-    if obj["signal"] not in ("BUY", "SELL", "HOLD"):
-        return None
+    if not required.issubset(obj): return None
+    if obj["signal"] not in ("BUY", "SELL", "HOLD"): return None
     try:
         obj["confidence"] = float(obj["confidence"])
-    except:
+    except Exception:
         return None
 
+    # Clean summary
     if "event_summary" in obj and isinstance(obj["event_summary"], list):
         obj["event_summary"] = [
             " ".join(p.split()[:15]) for p in obj["event_summary"]
         ]
     return obj
+
+
+def build_ai_summary(event, analysis):
+    flags = []
+    if event.get("late_news_risk"): flags.append("LATE_NEWS")
+    if "shadow_violation" in event: flags.append("REVIEW")
+
+    bias = "NEUTRAL"
+    if analysis["signal"] == "BUY":
+        bias = "BULLISH"
+    elif analysis["signal"] == "SELL":
+        bias = "BEARISH"
+
+    return {
+        "bias": bias,
+        "risk_flags": flags,
+        "headline": analysis.get("catalyst"),
+        "pdf_summary": analysis.get("event_summary", []),
+        "note": "Derived from official disclosure"
+    }
 
 
 def calibrate_confidence(raw, tier, market_phase, late_news, shadow):
@@ -84,18 +90,14 @@ def calibrate_confidence(raw, tier, market_phase, late_news, shadow):
         conf -= 0.05
     elif tier == "VERY":
         conf -= 0.03
-    if late_news:
-        conf -= 0.10
-    if shadow:
-        conf -= 0.07
-    if market_phase and market_phase != "LIVE":
-        conf -= 0.05
+    if late_news: conf -= 0.10
+    if shadow: conf -= 0.07
+    if market_phase and market_phase != "LIVE": conf -= 0.05
     return round(max(0.0, min(conf, 1.0)), 2)
 
 
 def smart_truncate(text: str) -> str:
-    if len(text) <= CONTEXT_CHAR_LIMIT:
-        return text
+    if len(text) <= CONTEXT_CHAR_LIMIT: return text
     h = int(CONTEXT_CHAR_LIMIT * 0.6)
     t = int(CONTEXT_CHAR_LIMIT * 0.4)
     return text[:h] + "\n...[TRUNCATED]...\n" + text[-t:]
@@ -104,25 +106,15 @@ def smart_truncate(text: str) -> str:
 def parse_binary(data: Union[bytes, memoryview]) -> str:
     try:
         text_content = []
-
-        # 1. Use slicing instead of startswith()
-        # This works for both 'bytes' and 'memoryview'
         if data[0:4] == b"%PDF":
             reader = PdfReader(io.BytesIO(data))
             pages = reader.pages
-            # Limit pages to save time/memory
-            total_pages = len(pages)
-            if total_pages > 4:
-                indices = [0, 1, 2, total_pages - 1]
-            else:
-                indices = range(total_pages)
-
+            indices = [0, 1, 2, len(pages) - 1] if len(pages) > 4 else range(len(pages))
             for i in indices:
                 t = pages[i].extract_text()
                 if t: text_content.append(t)
             return "\n".join(text_content)
 
-        # 2. Use slicing for ZIP check
         if data[0:2] == b"PK":
             with zipfile.ZipFile(io.BytesIO(data)) as z:
                 for f in z.namelist():
@@ -141,6 +133,7 @@ def parse_binary(data: Union[bytes, memoryview]) -> str:
     except Exception as e:
         logger.error(f"Binary parsing error: {e}")
         return ""
+
 
 async def fetch_doc(session, url: str) -> str:
     if not url or not url.startswith("http"):
@@ -168,6 +161,9 @@ async def fetch_doc(session, url: str) -> str:
 
                 logger.info(f"Parsing PDF ({size} bytes)...")
                 text = await asyncio.to_thread(parse_binary, buf.getbuffer())
+                buf.close()
+                del buf
+                gc.collect()
                 logger.info("PDF parsing complete.")
                 return text
 
@@ -304,42 +300,6 @@ def critic_prompt(event, analyst):
             ⚠️ No explanations outside JSON.
             """
 
-
-def normalize_ai_decision(analysis, config):
-    if analysis["signal"] in ("BUY", "SELL"):
-        if analysis["confidence"] < config.AI_MIN_CONFIDENCE:
-            analysis["signal"] = "HOLD"
-            analysis["tier"] = "NEUTRAL"
-            analysis["catalyst"] = "Insufficient confidence"
-
-    if analysis["tier"] == "EXTREME" and analysis["confidence"] < config.AI_MIN_CONFIDENCE:
-        analysis["tier"] = "VERY"
-
-    return analysis
-
-
-def build_ai_summary(event, analysis):
-    flags = []
-    if event.get("late_news_risk"):
-        flags.append("LATE_NEWS")
-    if "shadow_violation" in event:
-        flags.append("REVIEW")
-
-    bias = (
-        "BULLISH" if analysis["signal"] == "BUY"
-        else "BEARISH" if analysis["signal"] == "SELL"
-        else "NEUTRAL"
-    )
-
-    return {
-        "bias": bias,
-        "risk_flags": flags,
-        "headline": analysis.get("catalyst"),
-        "pdf_summary": analysis.get("event_summary", []),
-        "note": "Derived from official disclosure"
-    }
-
-
 class AIEngine:
 
     def __init__(self):
@@ -356,215 +316,164 @@ class AIEngine:
             self.session = aiohttp.ClientSession(headers=HEADERS)
         return self.session
 
-    async def _call_gemini_with_retry(self, prompt: str, temperature: float):
-        max_attempts = 4
-        delay = 20
-
-        for attempt in range(1, max_attempts + 1):
-            try:
-                logger.info(f"Calling ai (Attempt {attempt})...")
-                return await asyncio.to_thread(
-                    self.client.models.generate_content,
-                    model=MODEL_NAME,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(temperature=temperature)
-                )
-
-            except Exception as e:
-                err = str(e).upper()
-                retriable = ("429" in err or "RESOURCE_EXHAUSTED" in err or "503" in err)
-
-                if not retriable:
-                    logger.error(f"NON-RETRIABLE AI ERROR: {e}")
-                    return None
-
-                logger.warning(f"AI RATE LIMIT (Attempt {attempt}). Sleeping {delay}s")
-                await asyncio.sleep(delay)
-                delay *= 2
-
-        return None
+    async def call_ai(self, prompt, temperature):
+        # Retry Logic embedded here or use tenacity
+        return await asyncio.to_thread(
+            self.client.models.generate_content,
+            model=MODEL_NAME,
+            contents=prompt,
+            config=types.GenerateContentConfig(temperature=temperature)
+        )
 
     async def analyze(self, event):
         session = await self.get_session()
-        system_config = await BotConfig.load()
+        config = await BotConfig.load()
 
         docs = ""
-        pdf_urls = event.get("pdf_url", [])
-        # Log if we are about to fetch docs
-        if pdf_urls:
-            if isinstance(pdf_urls, str): pdf_urls = [pdf_urls]
+        urls = event.get("pdf_url", [])
+        if isinstance(urls, str): urls = [urls]
 
-            logger.info(f"Fetching {len(pdf_urls[:2])} documents in parallel...")
-            tasks = [fetch_doc(session, url) for url in pdf_urls[:2]]
-            results = await asyncio.gather(*tasks)
-            docs = "\n".join(results)
-        else:
-            logger.info("No PDF URLs found.")
+        if urls:
+            logger.info(f"Fetching docs for {event['clean_name']}")
+            docs = "\n".join(await asyncio.gather(
+                *[fetch_doc(session, u) for u in urls[:2]]
+            ))
 
         docs = smart_truncate(docs)
 
-        # --- ANALYST ---
-        logger.info("Running Analyst...")
-        analyst_resp = await self._call_gemini_with_retry(
-            analyst_prompt(event, docs),
-            temperature=0.1
-        )
-
-        if not analyst_resp:
-            logger.error("Analyst returned None")
+        # ---------- ANALYST ----------
+        try:
+            resp = await self.call_ai(analyst_prompt(event, docs), temperature=0.1)
+            analyst = extract_json(resp.text)
+        except Exception as e:
+            logger.error(f"Analyst Error: {e}")
             return None
-
-        analyst = extract_json(analyst_resp.text)
-        if not analyst:
-            analyst = repair_json(analyst_resp.text)
 
         analyst = validate_analysis(analyst)
+        if not analyst: return None
+        if analyst["signal"] in ("BUY", "SELL") and analyst["confidence"] < 0.65:
+            analyst["signal"] = "HOLD"
+            analyst["tier"] = "NEUTRAL"
+            analyst["confidence"] = 0.0
+            analyst["catalyst"] = "Insufficient confidence"
 
-        # HARD SAFETY VALIDATION
-        if analyst["signal"] in ("BUY", "SELL"):
-            if not (0.0 <= analyst["confidence"] <= 1.0):
-                return None
+        # Long-term material HOLD detection
+        if analyst["signal"] == "HOLD":
+            text = " ".join(analyst.get("event_summary", [])).lower()
+            if any(k in text for k in ("order", "contract", "crore", "revenue")):
+                analyst["tier"] = "MODERATE"
+                analyst["confidence"] = max(analyst["confidence"], 0.35)
 
-            if len(analyst.get("catalyst", "")) < 3:
-                analyst["signal"] = "HOLD"
-                analyst["confidence"] = 0.0
+        # ---------- CRITIC ----------
+        run_critic = (
+                             ENGINE_MODE == "RESEARCH"
+                             and analyst["signal"] == "HOLD"
+                             and analyst["tier"] in ("MODERATE", "VERY")
+                             and analyst["confidence"] >= 0.35
+                     ) or analyst["signal"] in ("BUY", "SELL")
 
+        analyst["critic_vetted"] = False
 
-        if not analyst:
-            logger.error(f"Analyst JSON validation failed: {analyst_resp.text[:100]}...")
-            return None
+        if run_critic:
+            try:
+                resp = await self.call_ai(critic_prompt(event, analyst), temperature=0.0)
+                critic = extract_json(resp.text)
+                if critic:
+                    analyst["critic_vetted"] = False
+                    if critic.get("veto"):
+                        logger.warning(f"Critic VETO: {critic.get('reason')}")
+                        analyst["signal"] = "HOLD"
+                        analyst["confidence"] = 0.0
+                        analyst["catalyst"] = critic.get("reason", "Risk veto")
+                    else:
+                        analyst["critic_vetted"] = True
+            except Exception as e:
+                logger.warning(f"Critic Failed (Defaulting to Analyst): {e}")
 
-        analyst = normalize_ai_decision(analyst,system_config)
-        logger.info(f"Analyst Decision: {analyst['signal']} ({analyst['confidence']})")
+        # ---------- CONFIDENCE ----------
+        analyst["confidence_raw"] = analyst["confidence"]
 
         if analyst["signal"] == "HOLD":
-            logger.info("-> Skipping Critic (Analyst voted HOLD)")
-            analyst["critic_vetted"] = False
+            # Just damp it, don't kill it completely if it was a "Watch" item
+            analyst["confidence_adjusted"] = round(analyst["confidence"] * 0.7, 2)
         else:
-            # --- CRITIC ---
-            logger.info("Running Critic...")
-            critic_resp = await self._call_gemini_with_retry(
-                critic_prompt(event, analyst),
-                temperature=0.0
+            analyst["confidence_adjusted"] = calibrate_confidence(
+                analyst["confidence"],
+                analyst["tier"],
+                event.get("market_phase"),
+                event.get("late_news_risk", False),
+                "shadow_violation" in event
             )
 
-            if not critic_resp:
-                logger.warning("Critic unavailable, defaulting to Analyst")
-            else:
-                critic = extract_json(critic_resp.text) or {"veto": False}
-                if critic.get("veto"):
-                    logger.info(f"Critic VETO: {critic.get('reason')}")
-                    analyst["signal"] = "HOLD"
-                    analyst["confidence"] = 0.0
-                    analyst["catalyst"] = critic.get("reason", "Risk veto")
-
-            analyst = normalize_ai_decision(analyst, system_config)
-
-        # --- FINAL CONFIDENCE ---
-        analyst["confidence_raw"] = analyst["confidence"]
-        analyst["confidence_adjusted"] = calibrate_confidence(
-            analyst["confidence"],
-            analyst["tier"],
-            event.get("market_phase"),
-            event.get("late_news_risk", False),
-            "shadow_violation" in event,
-        )
-
         analyst["confidence_label"] = (
-            "VERY_HIGH" if analyst["confidence_adjusted"] >= 0.75
-            else "HIGH" if analyst["confidence_adjusted"] >= 0.65
-            else "MEDIUM" if analyst["confidence_adjusted"] >= 0.50
-            else "LOW"
+            "VERY_HIGH" if analyst["confidence_adjusted"] >= 0.75 else
+            "HIGH" if analyst["confidence_adjusted"] >= 0.65 else
+            "MEDIUM" if analyst["confidence_adjusted"] >= 0.50 else
+            "LOW"
         )
 
         return analyst
 
-    async def close(self):
-        if self.session and not self.session.closed:
-            await self.session.close()
-
     async def run(self):
-        logger.info("AI Engine loop started.")
+        logger.info("AI Engine started.")
+
         while True:
             try:
-                gc.collect()
-
-                # 1. Backpressure Check
-                queue_len = await redis_client.llen(self.input_queue)
-                if queue_len > 0:
-                    logger.info(f"Queue Length: {queue_len}")
-
                 item = await redis_client.blpop(self.input_queue, timeout=60)
-                if not item:
-                    continue
+                if not item: continue
 
-                # 3. Parse Event
                 event = json.loads(item[1])
-                logger.info(f"Processing: {event.get('clean_name', 'Unknown')} | {event.get('title')}")
+                logger.info(f"Processing: {event.get('clean_name', 'Unknown')}")
 
                 start = datetime.now()
-
-                # 4. Run Analysis
                 result = await self.analyze(event)
 
-                # 5. Handle Failure
-                if not result:
-                    logger.warning(f"AI Analysis Failed for {event['clean_name']}")
-                    await ai_audit.insert_one({
-                        "event_id": event["event_id"],
-                        "signal": "HOLD",
-                        "catalyst": "AI_FAILURE",
-                        "timestamp": datetime.now(timezone.utc)
-                    })
-                    continue
+                if not result: continue
 
-                # 6. Save Audit
-                logger.info(f"Result: {result['signal']} | Conf: {result.get('confidence_adjusted')}")
+                # Save Audit
                 await ai_audit.insert_one({
                     "event_id": event["event_id"],
-                    "signal": result["signal"],
-                    "tier": result["tier"],
-                    "confidence_raw": result.get("confidence_raw"),
-                    "confidence_adjusted": result.get("confidence_adjusted"),
-                    "confidence_label": result.get("confidence_label"),
-                    "catalyst": result["catalyst"],
-                    "event_summary": result.get("event_summary"),
-                    "analysis": result.copy(),
+                    "analysis": {
+                        "signal": result["signal"],
+                        "tier": result["tier"],
+                        "confidence_raw": result["confidence_raw"],
+                        "confidence_adjusted": result["confidence_adjusted"],
+                        "confidence_label": result["confidence_label"],
+                        "catalyst": result["catalyst"],
+                        "event_summary": result.get("event_summary"),
+                        "critic_vetted": result.get("critic_vetted", False)
+                    },
+                    "engine_mode": ENGINE_MODE,
                     "schema_version": 2,
                     "timestamp": datetime.now(timezone.utc)
                 })
 
-                # 7. Push Signal (if valid)
                 if result["signal"] != "HOLD":
-                    try:
-                        summary_data = build_ai_summary(event, result)
-                        event["ai_analysis"] = result
-                        event["ai_summary"] = summary_data
+                    # [FIXED] Attach AI Analysis & Summary to Event
+                    event["ai_analysis"] = result
+                    event["ai_summary"] = build_ai_summary(event, result)
 
-                        await redis_client.rpush(self.output_queue, json.dumps(event))
-                        logger.info(f" *** SIGNAL PUSHED: {event['clean_name']} [{result['signal']}] ***")
-                    except Exception as e:
-                        logger.error(f"Summary Build Failed: {e}")
+                    await redis_client.rpush(self.output_queue, json.dumps(event))
+                    logger.info(f"🚀 SIGNAL PUSHED: {event['clean_name']} [{result['signal']}]")
 
-                # Rate Limiting
                 elapsed = (datetime.now() - start).total_seconds()
-                logger.info(f"Processed in {elapsed:.2f}s")
-
                 if elapsed < RATE_LIMIT_SECONDS:
                     await asyncio.sleep(RATE_LIMIT_SECONDS - elapsed)
 
             except Exception as e:
-                logger.error(f"CRITICAL LOOP ERROR: {e}", exc_info=True)
+                logger.error(f"ENGINE ERROR: {e}", exc_info=True)
                 await asyncio.sleep(1)
+
+            # Clean up
+            gc.collect()
+
+    async def close(self):
+        if self.session: await self.session.close()
 
 
 if __name__ == "__main__":
     engine = AIEngine()
     try:
         asyncio.run(engine.run())
-    finally:
-        try:
-            asyncio.run(engine.close())
-        except RuntimeError:
-            pass
-
+    except KeyboardInterrupt:
+        asyncio.run(engine.close())
