@@ -1,26 +1,22 @@
-import hashlib
+import asyncio
 import aiohttp
 import feedparser
-import logging
-import asyncio
-import re
+import hashlib
 import json
+import logging
+import time
+from datetime import datetime, timezone, time as dtime
 from collections import OrderedDict
-from datetime import datetime, timezone
-from dateutil import parser as date_parser
-from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
 import pytz
-
+import re
+import calendar
 from config import redis_client
 from utils.utility import normalize_company_name
 
-IST = pytz.timezone('Asia/Kolkata')
-
-logger = logging.getLogger("EVENT_POLLER")
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+IST = pytz.timezone("Asia/Kolkata")
 
 POLL_INTERVAL_SECONDS = 10
-REDIS_EXPIRY = 86400 * 1
+REDIS_EXPIRY = 86400  # 1 day
 
 RSS_SOURCES = {
     "BSE": "https://www.bseindia.com/data/xml/announcements.xml",
@@ -28,333 +24,309 @@ RSS_SOURCES = {
 }
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-    "Accept": "application/xml, text/xml, */*",
-    "Referer": "https://www.bseindia.com/",
-    "Cache-Control": "no-cache, no-store, must-revalidate",
-    "Pragma": "no-cache",
-    "Expires": "0"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    "Accept": "application/xml"
 }
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger("EVENT_POLLER")
 
-def _normalize_text(text):
-    if not text: return ""
-    return " ".join(text.strip().upper().split())
-
-
-def _normalize_bse_title(raw_title):
-    match = re.search(r"^(.*?)\s*\((\d{6})\)$", raw_title)
-    if match:
-        return match.group(1).strip(), match.group(2)
-    if re.match(r"^\d{6}$", raw_title):
-        return "UNKNOWN_BSE_SCRIP", raw_title
-    return raw_title.strip(), None
-
-
-def _parse_nse_description(description):
-    if "|SUBJECT:" in description:
-        parts = description.split("|SUBJECT:")
-        return parts[0].strip(), parts[1].strip()
-    return description.strip(), "General"
+def classify_market_phase(ts_ist: datetime) -> str:
+    t = ts_ist.time()
+    if ts_ist.weekday() >= 5:
+        return "WEEKEND"
+    if t < dtime(9, 0):
+        return "PRE_MARKET"
+    if dtime(9, 0) <= t < dtime(9, 15):
+        return "AUCTION"
+    if dtime(9, 15) <= t <= dtime(15, 30):
+        return "LIVE"
+    return "POST_MARKET"
 
 
-def is_relevant_stock(title, summary=""):
-    if not title: return False
-    junk_keywords = [
-        # --- MUTUAL FUNDS & DEBT (Specific) ---
-        "MUTUAL FUND", "NAV ", "NET ASSET VALUE",
-        " MF ",
-        "FIXED MATURITY PLAN", " FMP ",
-        " IDCW ", "FUND OF FUNDS", "INDEX FUND",
-        "EXCHANGE TRADED FUND", " ETF",  # Catches 'Gold ETF', 'Nifty ETF'
-        "NON-CONVERTIBLE DEBENTURES", " NCD ", "COMMERCIAL PAPER",
-        "INTEREST PAYMENT", "REDEMPTION OF",
-        "PORTFOLIO MANAGEMENT",
-
-        # --- ROUTINE COMPLIANCE ---
-        "LOSS OF SHARE", "LOST OF SHARE", "DUPLICATE SHARE",
-        "CLOSURE OF TRADING", "TRADING WINDOW", "WINDOW CLOSURE",
-        "INVESTOR GRIEVANCE", "COMPLIANCE CERTIFICATE",
-        "NEWSPAPER PUBLICATION", "POSTAL BALLOT", "E-VOTING",
-        "REGULATION 74", "REGULATION 76", "REGULATION 40",
-        "TRANSCRIPT OF", "AUDIO RECORDING",
-        "CLARIFICATION ON SPURT", "CLARIFICATION ON PRICE",
-        "MOVEMENT IN PRICE", "MOVEMENT IN VOLUME",
-
-        # --- SAFE BLOCKS ---
-        "RATING REAFFIRMED", "RATING WITHDRAWN", "REVIEW OF RATING",
-        "DIRECT PLAN", "REGULAR PLAN", "BENEFIT PLAN",  # Fixed Comma Here
-
-        # --- DEBT (Safe Filters Only) ---
-        "ISSUANCE OF DEBT",  # Blocks raising generic debt (usually routine)
-        "DEBT SECURITIES",  # Blocks Bond trading noise
-        "DEBT INSTRUMENT",  # Blocks Bond market noise
-        "SERVICING OF DEBT",  # Routine interest payments
-
-        # --- MISSING MF VARIATIONS (From your logs) ---
-        "MUTUAL F",  # Catches "ADITYA BIRLA SUN LIFE MUTUAL F" (Truncated title)
-        "FIXED TERM PLAN",  # Catches "BIRLA SUN LIFE FIXED TERM PLAN"
-        " FTP ",  # Short for Fixed Term Plan
-        "INTERVAL INCOME FUND",  # Catches "INTERVAL INCOME FUND"
-        "RESURGENT INDIA FUND",  # Catches the specific scheme in your logs
-        "DUAL ADVANTAGE FUND",  # Catches the "Series 2" fund in your logs
-
-        # --- GENERIC MF TERMS (Safe to block) ---
-        "GROWTH OPTION",  # MF Terminology (Safe: Companies don't call growth "Growth Option")
-        "DIVIDEND PAYOUT",  # MF Terminology
-        "DIVIDEND SWEEP",  # MF Terminology
-        "DIVIDEND REINVESTMENT",  # MF Terminology
-
-        # --- DEBT/BONDS (Safe filters) ---
-        "ISSUANCE OF DEBT",  # Blocks raising debt (Routine)
-        "DEBT SECURITIES",  # Blocks Bond trading
-        "DEBT INSTRUMENT",  # Blocks Bond market
-        "SERVICING OF DEBT",  # Routine interest payments
-    ]
-    text_to_check = (title + " " + summary).upper()
-    if any(keyword in text_to_check for keyword in junk_keywords): return False
-    if "-ETF" in text_to_check or " ETF" in text_to_check: return False
-    return True
+def trade_eligibility_from_phase(phase: str) -> str:
+    if phase in ("PRE_MARKET", "AUCTION", "POST_MARKET", "WEEKEND"):
+        return "NEXT_SESSION_ONLY"
+    return "IMMEDIATE"
 
 
-def _parse_timestamp(time_str):
-    try:
-        if not time_str:
-            return datetime.now(timezone.utc).isoformat()
-        dt = date_parser.parse(time_str)
-        if dt.tzinfo is None:
-            dt = IST.localize(dt)
-        return dt.astimezone(timezone.utc).isoformat()
-    except Exception as e:
-        logger.debug(f"Date Parse Error: {e}")
-        return datetime.now(timezone.utc).isoformat()
+def generate_event_id(source, join_key, title, doc_urls):
+    base = f"{source}|{join_key}|{title}"
+    h = hashlib.md5(base.encode()).hexdigest()[:10]
 
-
-def _extract_doc_urls(entry) -> list:
-    doc_links = []
-    allowed_exts = (".pdf", ".xml", ".zip")
-    main_link = entry.get("link", "")
-    if main_link.lower().endswith(allowed_exts):
-        doc_links.append(main_link)
-    for link in entry.get("links", []):
-        href = link.get("href", "")
-        if href.lower().endswith(allowed_exts):
-            if href not in doc_links:
-                doc_links.append(href)
-    return doc_links
-
-
-def _generate_id(source, entry, scrip_code=None):
-    doc_urls = _extract_doc_urls(entry)
-    # Strategy 1: PDF Filename + Identifier
     if doc_urls:
-        filename = doc_urls[0].split('/')[-1]
-        if scrip_code:
-            unique_identifier = scrip_code
-        else:
-            unique_identifier = hashlib.md5(entry.get('title', '').encode()).hexdigest()[:8]
-        return f"{source}_{unique_identifier}_{filename}"
+        doc_hash = hashlib.md5("".join(doc_urls).encode()).hexdigest()[:6]
+        return f"{source}_{h}_{doc_hash}"
 
-    # Strategy 2: GUID
-    guid = entry.get('guid')
-    if guid:
-        clean_guid = re.sub(r'\W+', '', guid)[-20:]
-        return f"{source}_GUID_{clean_guid}"
-
-    # Strategy 3: Content Hash
-    raw_string = f"{entry.get('title', '')}{entry.get('published', '')}"
-    content_hash = hashlib.md5(raw_string.encode('utf-8')).hexdigest()[:15]
-    return f"{source}_HASH_{content_hash}"
-
+    return f"{source}_{h}"
 
 def parse_entry(source, entry):
     try:
-        raw_title = entry.get("title", "")
-        summary_raw = entry.get("summary", "") or entry.get("description", "")
+        ingestion_ts = datetime.now(timezone.utc)
 
-        if not is_relevant_stock(raw_title,summary_raw):
+        raw_title = entry.get("title", "").strip()
+        summary = entry.get("summary", "") or entry.get("description", "")
+        if not raw_title:
             return None
 
-        scrip_code = None
-        category = "General"
-        raw_company_name = raw_title
-        clean_name = ""
-        join_key = ""
+        text = f"{raw_title} {summary}".upper()
+        noise_keywords = [
+            # --- MUTUAL FUNDS & DEBT (Specific) ---
+            "MUTUAL FUND", "NAV ", "NET ASSET VALUE",
+            " MF ",
+            "FIXED MATURITY PLAN", " FMP ",
+            " IDCW ", "FUND OF FUNDS", "INDEX FUND",
+            "EXCHANGE TRADED FUND", " ETF",  # Catches 'Gold ETF', 'Nifty ETF'
+            "NON-CONVERTIBLE DEBENTURES", " NCD ", "COMMERCIAL PAPER",
+            "INTEREST PAYMENT", "REDEMPTION OF",
+            "PORTFOLIO MANAGEMENT",
 
-        if source == "BSE":
-            raw_company_name, scrip_code = _normalize_bse_title(raw_title)
-            if not scrip_code and hasattr(entry, 'scripcode'):
-                scrip_code = entry.scripcode
-            clean_name = normalize_company_name(raw_company_name)
-            join_key = scrip_code if scrip_code else clean_name
+            # --- ROUTINE COMPLIANCE ---
+            "LOSS OF SHARE", "LOST OF SHARE", "DUPLICATE SHARE",
+            "CLOSURE OF TRADING", "TRADING WINDOW", "WINDOW CLOSURE",
+            "INVESTOR GRIEVANCE", "COMPLIANCE CERTIFICATE",
+            "NEWSPAPER PUBLICATION", "POSTAL BALLOT", "E-VOTING",
+            "REGULATION 74", "REGULATION 76", "REGULATION 40",
+            "TRANSCRIPT OF", "AUDIO RECORDING",
+            "CLARIFICATION ON SPURT", "CLARIFICATION ON PRICE",
+            "MOVEMENT IN PRICE", "MOVEMENT IN VOLUME",
 
-        elif source == "NSE":
-            clean_name = normalize_company_name(raw_title)
-            summary_raw, category = _parse_nse_description(summary_raw)
-            join_key = clean_name
+            # --- SAFE BLOCKS ---
+            "DIRECT PLAN", "REGULAR PLAN", "BENEFIT PLAN",  # Fixed Comma Here
 
-        ts_str = _parse_timestamp(entry.get("published", ""))
+            # --- DEBT (Safe Filters Only) ---
+            "ISSUANCE OF DEBT",  # Blocks raising generic debt (usually routine)
+            "DEBT SECURITIES",  # Blocks Bond trading noise
+            "DEBT INSTRUMENT",
+            "DEBT_INSTRUMENT",# Blocks Bond market noise
+            "SERVICING OF DEBT",  # Routine interest payments
+
+            # --- MISSING MF VARIATIONS (From your logs) ---
+            "MUTUAL F",
+            "FIXED TERM PLAN",
+            " FTP ",  # Short for Fixed Term Plan
+            "INTERVAL INCOME FUND",  # Catches "INTERVAL INCOME FUND"
+            "RESURGENT INDIA FUND",  # Catches the specific scheme in your logs
+            "DUAL ADVANTAGE FUND",  # Catches the "Series 2" fund in your logs
+
+            # --- GENERIC MF TERMS (Safe to block) ---
+            "GROWTH OPTION",  # MF Terminology (Safe: Companies don't call growth "Growth Option")
+            "DIVIDEND PAYOUT",  # MF Terminology
+            "DIVIDEND SWEEP",  # MF Terminology
+            "DIVIDEND REINVESTMENT",  # MF Terminology
+
+            # --- DEBT/BONDS (Safe filters) ---
+            "ISSUANCE OF DEBT",  # Blocks raising debt (Routine)
+            "DEBT SECURITIES",  # Blocks Bond trading
+            "DEBT INSTRUMENT",  # Blocks Bond market
+            "SERVICING OF DEBT"
+        ]
+        if any(k in text for k in noise_keywords):
+            return None
+
+        clean_name = normalize_company_name(raw_title)
+        join_key = clean_name
+
+        published = entry.get("published_parsed")
+        disclosure_ts = None
+
+        # 1. Try standard RSS date
+        if published:
+            try:
+                disclosure_ts = datetime.fromtimestamp(calendar.timegm(published), tz=timezone.utc)
+            except Exception:
+                pass
+
+        if not disclosure_ts:
+            try:
+                text_search = f"{summary} {raw_title}"
+                match_dt = re.search(r"(\d{1,2}-[A-Za-z]{3}-\d{4}\s+\d{1,2}:\d{1,2}:\d{1,2})", text_search)
+
+                if match_dt:
+                    dt_str = match_dt.group(1)
+                    # Parse assuming IST
+                    dt_obj = datetime.strptime(dt_str, "%d-%b-%Y %H:%M:%S")
+                    disclosure_ts = IST.localize(dt_obj).astimezone(timezone.utc)
+            except Exception:
+                pass
+
+        if not disclosure_ts:
+            disclosure_ts = ingestion_ts
+
+
+        disclosure_ts_ist = disclosure_ts.astimezone(IST)
+        ingestion_ts_ist = ingestion_ts.astimezone(IST)
+
+        latency = int((ingestion_ts - disclosure_ts).total_seconds())
+        latency = max(0, min(latency, 86400))
+
+        market_phase = classify_market_phase(ingestion_ts_ist)
+        disclosure_phase = classify_market_phase(disclosure_ts_ist)
+
+        urgency = "LOW"
+        if market_phase == "LIVE":
+            if ingestion_ts_ist.time() < dtime(11, 0):
+                urgency = "HIGH"
+            elif ingestion_ts_ist.time() < dtime(14, 30):
+                urgency = "MEDIUM"
+            if disclosure_phase == "LIVE" and latency < 300:
+                urgency = "EXTREME"
+
+        price_context = "IGNORE"
+        if market_phase == "LIVE":
+            price_context = "CHECK_REQUIRED"
+        elif market_phase == "PRE_MARKET":
+            price_context = "GAP_CHECK"
+
+        doc_urls = []
+        if entry.get("links"):
+            for l in entry["links"]:
+                href = l.get("href", "")
+                if href.lower().endswith((".pdf", ".zip", ".xml")):
+                    doc_urls.append(href)
+        elif entry.get("link"):
+            doc_urls.append(entry["link"])
+
+        event_id = generate_event_id(
+            source, join_key, raw_title, doc_urls
+        )
 
         return {
             "source": source,
-            "event_id": _generate_id(source, entry, scrip_code),
-            "raw_name": raw_company_name,
+            "event_id": event_id,
+            "raw_name": raw_title,
             "clean_name": clean_name,
             "join_key": join_key,
-            "scrip_code": scrip_code,
-            "title": _normalize_text(raw_title),
-            "category": _normalize_text(category),
-            "summary": _normalize_text(summary_raw),
-            "timestamp": ts_str,
-            "pdf_url": _extract_doc_urls(entry),
+            "title": raw_title.upper(),
+            "summary": summary.upper(),
+            "pdf_url": doc_urls,
+            "disclosure_ts": disclosure_ts.isoformat(),
+            "ingestion_ts": ingestion_ts.isoformat(),
+            "latency_seconds": latency,
+            "market_phase": market_phase,
+            "disclosure_market_phase": disclosure_phase,
+            "trade_eligibility": trade_eligibility_from_phase(market_phase),
+            "event_urgency": urgency,
+            "price_context": price_context,
             "status": "RAW"
         }
 
     except Exception as e:
-        logger.error(f"Parser logic failed for {source}: {e}", exc_info=True)
+        logger.error(f"Parse error: {e}", exc_info=True)
         return None
 
 
 class RSSEventFetcher:
     def __init__(self):
-        self.session = None
         self.output_queue = "QUEUE:NORMALIZED_EVENTS"
-        self.is_running = True
+        self.local_seen = OrderedDict()
+        self.MAX_CACHE = 8000
 
-        # --- STATE OPTIMIZATION ---
-        self.last_modified_times = {}  # For NSE (Headers)
-        self.last_content_hashes = {}  # For BSE (Content Fingerprint)
-        self.local_seen_cache = OrderedDict()  # Rolling Window Cache
-        self.CACHE_LIMIT = 10000
+    async def fetch(self, session, source, url):
+        try:
+            headers = {}
+            last_mod = await redis_client.get(f"POLLER:LAST_MOD:{source}")
+            if last_mod:
+                headers["If-Modified-Since"] = last_mod
+            else:
+                logger.info(f"[{source}] Polling (No previous Last-Mod found)")
 
-    async def _get_session(self):
-        if self.session is None or self.session.closed:
-            timeout = aiohttp.ClientTimeout(total=15, connect=5)
-            connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300, ssl=False)
-            self.session = aiohttp.ClientSession(connector=connector, headers=HEADERS, timeout=timeout)
-        return self.session
+            content = None
 
-    async def _dispatch_to_redis(self, event):
-        if event['source'] == 'BSE':
-            scrip = str(event.get('scrip_code', ''))
-            if scrip and (scrip.startswith('9') or scrip.startswith('8') or scrip.startswith('7')):
+            for attempt in range(2):
+                try:
+                    async with session.get(url, headers=headers) as resp:
+                        # LOGGING POINT 2: Verify the Server Response
+                        if resp.status == 304:
+                            logger.info(f"[{source}] HTTP 304: No new data (Skipping parse)")
+                            return
+
+                        if resp.status == 200:
+                            logger.info(f"[{source}] HTTP 200: New data received. Downloading...")
+                        else:
+                            logger.warning(f"[{source}] Unexpected Status: {resp.status}")
+                            if resp.status >= 500:
+                                raise aiohttp.ClientError()
+                            return
+
+                        lm = resp.headers.get("Last-Modified")
+                        if lm:
+                            await redis_client.set(f"POLLER:LAST_MOD:{source}", lm)
+
+                        content = await resp.read()
+                        break
+                except (aiohttp.ClientError, asyncio.TimeoutError):
+                    if attempt == 1:
+                        logger.warning(f"[{source}] Fetch failed (Timeout/Connection).")
+                        return
+                    await asyncio.sleep(1)
+
+            if not content:
                 return
 
-        evt_id = event['event_id']
-
-        # 1. RAM CHECK
-        if evt_id in self.local_seen_cache:
-            self.local_seen_cache.move_to_end(evt_id)
-            return
-
-        dedupe_key = f"POLLER:SEEN:{event['event_id']}"
-
-        try:
-            # 2. REDIS CHECK
-            is_new = await redis_client.set(dedupe_key, "1", ex=REDIS_EXPIRY, nx=True)
-
-            if is_new:
-                logger.info(f"NEW: {event['clean_name']} [{event['source']}]")
-                self.local_seen_cache[evt_id] = True
-                await redis_client.rpush(self.output_queue, json.dumps(event))
-            else:
-                self.local_seen_cache[evt_id] = True
-
-            if len(self.local_seen_cache) > self.CACHE_LIMIT:
-                self.local_seen_cache.popitem(last=False)
-
-        except Exception as e:
-            logger.error(f"Redis Dispatch Error: {e}")
-
-    @retry(
-        stop=stop_after_attempt(2),
-        wait=wait_fixed(1),
-        retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError))
-    )
-    async def fetch_one(self, source, url):
-        session = await self._get_session()
-
-        # --- STRATEGY 1: IF-MODIFIED-SINCE (Works for NSE) ---
-        req_headers = {}
-        if url in self.last_modified_times:
-            req_headers['If-Modified-Since'] = self.last_modified_times[url]
-
-        try:
-            async with session.get(url, headers=req_headers) as response:
-
-                # [NSE] Bandwidth Saver
-                if response.status == 304:
-                    # Log optimization success
-                    logger.info(f"[{source}] 304 Not Modified | Skipping Parse")
+            if source == "BSE":
+                hash_key = f"POLLER:HASH:{source}:{url}"
+                content_hash = hashlib.md5(content).hexdigest()
+                last_hash = await redis_client.get(hash_key)
+                if last_hash and last_hash == content_hash:
+                    logger.info(f"[{source}] Content Hash matches previous pull. (Skipping parse)")
                     return
 
-                if response.status == 200:
-                    # Update Timestamp for next time
-                    last_mod = response.headers.get('Last-Modified')
-                    if last_mod:
-                        self.last_modified_times[url] = last_mod
+                logger.info(f"[{source}] Content Hash changed. Processing feed...")
+                await redis_client.set(hash_key, content_hash)
 
-                    content = await response.read()
+            feed = await asyncio.to_thread(feedparser.parse, content)
 
-                    # --- STRATEGY 2: CONTENT HASHING (Works for BSE) ---
-                    # Even if BSE sends 200 OK, we calculate the MD5 hash of the file.
-                    # If the hash is same as last time, the file hasn't changed.
-                    # We SKIP parsing entirely. Zero CPU usage.
-                    current_hash = hashlib.md5(content).hexdigest()
-                    if self.last_content_hashes.get(url) == current_hash:
-                        # Log optimization success
-                        logger.info(f"[{source}] MD5 Hash Match | Skipping Parse")
-                        return
+            new_count = 0
+            for entry in reversed(feed.entries):
+                evt = parse_entry(source, entry)
+                if not evt:
+                    continue
 
-                    # New content detected! Update hash and parse.
-                    self.last_content_hashes[url] = current_hash
-                    # logger.info(f"[{source}] New Content Detected (Hash: {current_hash[:8]}...)")
+                key = evt["event_id"]
 
-                    feed = await asyncio.to_thread(feedparser.parse, content)
-                    if not feed.entries:
-                        return
+                if key in self.local_seen:
+                    continue
 
-                    for entry in reversed(feed.entries):
-                        parsed = parse_entry(source, entry)
-                        if parsed:
-                            await self._dispatch_to_redis(parsed)
-                    return
+                is_new = await redis_client.set(
+                    f"POLLER:SEEN:{key}", "1", ex=REDIS_EXPIRY, nx=True
+                )
+                if not is_new:
+                    continue
 
-                logger.warning(f"{source} Down: {response.status}")
+                self.local_seen[key] = time.time()
+                await redis_client.rpush(self.output_queue, json.dumps(evt))
+
+                logger.info(f"New Event [{source}]: {evt['clean_name']}")
+                new_count += 1
+
+                if len(self.local_seen) > self.MAX_CACHE:
+                    self.local_seen.popitem(last=False)
+
+            if new_count == 0 and source == "NSE":
+                logger.info(f"[{source}] Parsed feed but found 0 new relevant events.")
 
         except Exception as e:
-            logger.error(f"Fetch Error ({source}): {str(e)}")
+            logger.error(f"Fetch Loop Error {source}: {e}", exc_info=True)
 
-    async def run_loop(self):
-        logger.info(f"Event Poller Started. Interval: {POLL_INTERVAL_SECONDS}s")
-
-        while self.is_running:
-            start_time = datetime.now()
-            try:
-                tasks = [self.fetch_one(src, url) for src, url in RSS_SOURCES.items()]
-                await asyncio.gather(*tasks)
-            except Exception as e:
-                logger.critical(f"Global Poller Loop Error: {e}", exc_info=True)
-
-            elapsed = (datetime.now() - start_time).total_seconds()
-            sleep_time = max(0.5, POLL_INTERVAL_SECONDS - elapsed)
-            await asyncio.sleep(sleep_time)
-
-    async def close(self):
-        logger.info("Shutting down Poller...")
-        self.is_running = False
-        if self.session:
-            await self.session.close()
+    async def run(self):
+        logger.info("Event Poller Started")
+        timeout = aiohttp.ClientTimeout(total=60)
+        async with aiohttp.ClientSession(headers=HEADERS, timeout=timeout) as session:
+            while True:
+                tasks = [
+                    self.fetch(session, src, url)
+                    for src, url in RSS_SOURCES.items()
+                ]
+                await asyncio.gather(*tasks, return_exceptions=True)
+                await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
 
 if __name__ == "__main__":
-    fetcher = RSSEventFetcher()
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
     try:
-        loop.run_until_complete(fetcher.run_loop())
+        asyncio.run(RSSEventFetcher().run())
     except KeyboardInterrupt:
-        loop.run_until_complete(fetcher.close())
-    finally:
-        loop.close()
+        logger.info("Poller stopped")

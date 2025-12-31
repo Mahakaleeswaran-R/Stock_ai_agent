@@ -1,86 +1,131 @@
 import logging
 from datetime import datetime, timedelta
 import pytz
+
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from analyser.performance_analyser import PerformanceAnalyzer
+from analyser.performance_analyser import PerfromanceAnalyser
 from config import redis_client, raw_events, ai_audit, technical_audit
-
 from jobs.ISIN_lookup import ISINLookupService
 from jobs.feedback_layer import run as run_feedback_job
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger("SCHEDULER")
-IST = pytz.timezone('Asia/Kolkata')
 
+IST = pytz.timezone("Asia/Kolkata")
+_scheduler: AsyncIOScheduler | None = None
 
 async def job_data_cleanup():
-    logger.info("STARTING NIGHTLY STORAGE PURGE...")
+    logger.info("STARTING NIGHTLY STORAGE PURGE")
     try:
-        retention_cutoff = datetime.now(IST) - timedelta(days=7)
+        cutoff = datetime.now(IST) - timedelta(days=3)
+
         res_events = await raw_events.delete_many({
-            "timestamp": {"$lt": retention_cutoff.isoformat()}
+            "ingestion_ts": {"$lt": cutoff.isoformat()}
         })
-        logger.info(f"Wiped {res_events.deleted_count} old Raw Events.")
+        logger.info(f"Purged {res_events.deleted_count} raw events")
 
         res_ai = await ai_audit.delete_many({
-            "timestamp": {"$lt": retention_cutoff}
+            "timestamp": {"$lt": cutoff}
         })
-        logger.info(f"Wiped {res_ai.deleted_count} old AI Audit logs.")
+        logger.info(f"Purged {res_ai.deleted_count} AI audit logs")
 
         res_tech = await technical_audit.delete_many({
-            "timestamp": {"$lt": retention_cutoff}
+            "timestamp": {"$lt": cutoff}
         })
-        logger.info(f"Wiped {res_tech.deleted_count} old Technical Audit logs.")
-        queues = ["QUEUE:NORMALIZED_EVENTS", "QUEUE:FILTERED_EVENTS", "QUEUE:AI_SIGNALS", "QUEUE:TRADE_SIGNALS"]
+        logger.info(f"Purged {res_tech.deleted_count} technical logs")
+
+        # Nightly reset
+        await redis_client.delete(
+            "RISK:OPEN_TRADES_COUNT",
+            "RISK:LOSS_STREAK"
+        )
+
+        queues = [
+            "QUEUE:NORMALIZED_EVENTS",
+            "QUEUE:FILTERED_EVENTS",
+            "QUEUE:AI_SIGNALS",
+            "QUEUE:TRADE_SIGNALS"
+        ]
+
         for q in queues:
             q_len = await redis_client.llen(q)
             if q_len > 2000:
-                logger.warning(f"{q} overflowing ({q_len}). Trimming to last 2000.")
+                logger.warning(f"{q} overflow ({q_len}) → trimming")
                 await redis_client.ltrim(q, -2000, -1)
-        logger.info("Daily Purge Complete. Storage reclaimed.")
+
+        logger.info("Nightly cleanup completed")
+
     except Exception as e:
-        logger.error(f"Cleanup Failed: {e}")
+        logger.error(f"Cleanup job failed: {e}", exc_info=True)
 
 
 async def job_isin_update():
-    logger.info("REFRESHING ISIN MAP (Market Prep)...")
+    logger.info("REFRESHING ISIN MAP")
     try:
-        service = ISINLookupService()
-        await service.run()
-        logger.info("ISIN Sync Completed")
+        await ISINLookupService().run()
+        logger.info("ISIN sync completed")
     except Exception as e:
-        logger.error(f"ISIN Job Failed: {e}")
+        logger.error(f"ISIN job failed: {e}", exc_info=True)
+
 
 async def job_performance_analyser():
-    logger.info("Analysing performance data...")
+    logger.info("Running performance analyzer")
     try:
-        service = PerformanceAnalyzer()
+        service = PerfromanceAnalyser()
         await service.run()
-        logger.info("Performance Analysis Job Completed")
+        logger.info("Performance analysis completed")
     except Exception as e:
-        logger.error(f"Performance Analysis Job: {e}")
+        logger.error(f"Performance analyzer failed: {e}", exc_info=True)
 
 
-def start_scheduler():
+def start_scheduler() -> AsyncIOScheduler:
+    global _scheduler
+
+    if _scheduler and _scheduler.running:
+        logger.warning("Scheduler already running — skipping restart")
+        return _scheduler
+
     scheduler = AsyncIOScheduler(timezone=IST)
 
-    # ISIN Sync: 08:30 AM IST
-    scheduler.add_job(job_isin_update, CronTrigger(hour=8, minute=30, timezone=IST))
+    scheduler.add_job(
+        job_isin_update,
+        CronTrigger(hour=8, minute=30, timezone=IST),
+        id="isin_sync",
+        max_instances=1,
+        replace_existing=True,
+    )
 
-    # Performance Analyzer: 04:30 PM IST
-    scheduler.add_job(job_performance_analyser, CronTrigger(hour=16, minute=30, timezone=IST))
+    scheduler.add_job(
+        job_performance_analyser,
+        CronTrigger(hour=1, minute=00, timezone=IST),
+        id="performance_analysis",
+        max_instances=1,
+        replace_existing=True,
+    )
 
-    # Feedback Layer: 08:00 PM IST
-    scheduler.add_job(run_feedback_job, CronTrigger(hour=20, minute=0, timezone=IST))
+    scheduler.add_job(
+        run_feedback_job,
+        CronTrigger(hour=20, minute=0, timezone=IST),
+        id="feedback_layer",
+        max_instances=1,
+        replace_existing=True,
+    )
 
-    # Cleanup: 11:30 PM IST
-    scheduler.add_job(job_data_cleanup, CronTrigger(hour=23, minute=30, timezone=IST))
+    scheduler.add_job(
+        job_data_cleanup,
+        CronTrigger(hour=2, minute=30, timezone=IST),
+        id="cleanup",
+        max_instances=1,
+        replace_existing=True,
+    )
 
     scheduler.start()
-    logger.info("Scheduler Active")
+    _scheduler = scheduler
+
+    logger.info("Scheduler started successfully")
     return scheduler

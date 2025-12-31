@@ -3,138 +3,179 @@ import json
 import logging
 import asyncio
 import re
-from datetime import datetime
 import pytz
 from bson import ObjectId
-
+from datetime import datetime, timezone, timedelta
 from config import redis_client, raw_events
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger("EVENT_FILTER")
 
-IST = pytz.timezone('Asia/Kolkata')
+IST = pytz.timezone("Asia/Kolkata")
 
 CACHED_BAD_KEYWORDS = set()
 CACHED_SHADOW_KEYWORDS = set()
-LAST_KEYWORD_REFRESH = datetime.min
+LAST_KEYWORD_REFRESH = datetime.now(timezone.utc) - timedelta(days=1)
 
+KEYWORD_REFRESH_SECONDS = 6000
+SIMILARITY_CACHE_TTL = 6 * 3600  # 6 hours
 
-async def _refresh_keywords_if_needed():
-    global CACHED_BAD_KEYWORDS, CACHED_SHADOW_KEYWORDS, LAST_KEYWORD_REFRESH
-    now = datetime.now()
-    if (now - LAST_KEYWORD_REFRESH).total_seconds() > 6000:  # 100 Mins
-        try:
-            bad = await redis_client.smembers("CONFIG:BAD_KEYWORDS")
-            CACHED_BAD_KEYWORDS = {k.decode() if isinstance(k, bytes) else k for k in bad}
+SEQUEL_KEYWORDS = [
+    "FURTHER", "ADDITIONAL", "CLARIFICATION", "DETAILS",
+    "UPDATE", "CORRIGENDUM", "OUTCOME", "REVISED", "PRESS RELEASE"
+]
 
-            shadow = await redis_client.smembers("CONFIG:SHADOW_KEYWORDS")
-            CACHED_SHADOW_KEYWORDS = {k.decode() if isinstance(k, bytes) else k for k in shadow}
+CORP_ACTION_WHITELIST = [
+    "RESIGNATION", "APPOINTMENT", "CHANGE IN DIRECTOR",
+    "KEY MANAGERIAL PERSONNEL", "AUDITOR", "COMPLIANCE OFFICER"
+]
 
-            LAST_KEYWORD_REFRESH = now
-        except:
-            pass
-
-
-async def _get_isin(join_key, source):
-    redis_key = f"CONFIG:ISIN:{source}"
-    isin = await redis_client.hget(redis_key, join_key)
-    if isin:
-        return isin.decode('utf-8') if isinstance(isin, bytes) else isin
-    return None
 
 def json_serial(obj):
-    if isinstance(obj, (datetime, datetime.date)):
+    if isinstance(obj, datetime):
         return obj.isoformat()
     if isinstance(obj, ObjectId):
         return str(obj)
     raise TypeError(f"Type {type(obj)} not serializable")
 
 
+async def _refresh_keywords_if_needed():
+    global CACHED_BAD_KEYWORDS, CACHED_SHADOW_KEYWORDS, LAST_KEYWORD_REFRESH
+
+    now = datetime.now(timezone.utc)
+    if (now - LAST_KEYWORD_REFRESH).total_seconds() < KEYWORD_REFRESH_SECONDS:
+        return
+
+    try:
+        bad = await redis_client.smembers("CONFIG:BAD_KEYWORDS")
+        shadow = await redis_client.smembers("CONFIG:SHADOW_KEYWORDS")
+
+        CACHED_BAD_KEYWORDS = {
+            (k.decode() if isinstance(k, bytes) else k).upper() for k in bad
+        }
+        CACHED_SHADOW_KEYWORDS = {
+            (k.decode() if isinstance(k, bytes) else k).upper() for k in shadow
+        }
+        LAST_KEYWORD_REFRESH = now
+    except Exception as e:
+        logger.warning(f"Keyword refresh failed: {e}")
+
+
+async def _get_isin(join_key, source):
+    try:
+        key = f"CONFIG:ISIN:{source}"
+        val = await redis_client.hget(key, join_key)
+        if not val:
+            return None
+        return val.decode() if isinstance(val, bytes) else val
+    except Exception:
+        return None
+
+
+def classify_event_type(title: str) -> str:
+    t = title.upper()
+    if "RESULT" in t or "FINANCIAL" in t:
+        return "RESULT"
+    if "ORDER" in t or "CONTRACT" in t:
+        return "ORDER"
+    if "RESIGNATION" in t or "AUDITOR" in t:
+        return "GOVERNANCE"
+    if "SEBI" in t or "RAID" in t or "REGULATOR" in t:
+        return "REGULATORY"
+    return "GENERAL"
+
+
 async def _update_last_event_cache(key, event):
-    cache_data = {
-        "title": event['title'],
-        "summary": event.get('summary', ''),
-        "timestamp": event['timestamp'],
-        "source": event['source']
+    payload = {
+        "title": event["title"],
+        "summary": event.get("summary", ""),
+        "timestamp": event["event_ts"],
+        "source": event["source"]
     }
-    await redis_client.setex(key, 3600, json.dumps(cache_data))
+    await redis_client.setex(key, SIMILARITY_CACHE_TTL, json.dumps(payload))
 
-
-async def _check_smart_similarity(isin, current_event):
-    if not isin:
-        # Fallback: If no ISIN, check using Company Name to prevent duplicates
-        clean_name = current_event['clean_name'].replace(" ", "").upper()
-        last_event_key = f"CACHE:LAST_EVENT:NAME:{clean_name}"
+async def _check_smart_similarity(isin, event):
+    # 1. Define Cache Key (Prefer ISIN, Fallback to Name)
+    if isin:
+        cache_key = f"CACHE:LAST_EVENT:{isin}"
     else:
-        last_event_key = f"CACHE:LAST_EVENT:{isin}"
+        # Remove spaces for tighter matching (e.g. "Tata Motors" == "TataMotors")
+        clean = event["clean_name"].replace(" ", "").upper()
+        cache_key = f"CACHE:LAST_EVENT:NAME:{clean}"
 
-    last_event_raw = await redis_client.get(last_event_key)
+    cached = await redis_client.get(cache_key)
+    title = event["title"].upper()
 
-    if last_event_raw:
-        last_event = json.loads(last_event_raw)
+    # 2. Allow "Sequels" to pass
+    if any(title.startswith(k) for k in SEQUEL_KEYWORDS):
+        await _update_last_event_cache(cache_key, event)
+        return False
 
-        # 1. Timestamp Check
-        try:
-            last_ts = datetime.fromisoformat(last_event['timestamp'])
-            curr_ts = datetime.fromisoformat(current_event['timestamp'])
-            # If news is > 20 mins apart, assume it is NEW news (e.g. Outcome followed by Press Release)
-            if abs((curr_ts - last_ts).total_seconds()) > 1200:
-                await _update_last_event_cache(last_event_key, current_event)
-                return False
-        except:
-            pass  # Date parsing error, proceed to text check
+    if not cached:
+        await _update_last_event_cache(cache_key, event)
+        return False
 
-        # 2. Text Cleaning
-        def clean(t):
-            return re.sub(r'[^A-Z0-9]', '', t.upper())
+    last = json.loads(cached)
 
-        title_a = clean(last_event['title'])
-        title_b = clean(current_event['title'])
+    # 3. Time Window Check (> 20 mins = New Event)
+    try:
+        last_ts = datetime.fromisoformat(last["timestamp"])
+        curr_ts = datetime.fromisoformat(event["event_ts"])
+        if abs((curr_ts - last_ts).total_seconds()) > 1200:
+            await _update_last_event_cache(cache_key, event)
+            return False
+    except Exception:
+        pass
 
-        # 3. Ratio Calculation
-        ratio = difflib.SequenceMatcher(None, title_a, title_b).ratio()
+    # 4. Text Similarity
+    def clean_text(t):
+        return re.sub(r"[^A-Z0-9]", "", t.upper())
 
-        is_dupe = False
-        if last_event['source'] == current_event['source']:
-            # Same Exchange: Needs high similarity (e.g. Correction vs Original)
-            if ratio > 0.90: is_dupe = True
-        else:
-            # Cross Exchange (NSE vs BSE): Aggressive check
-            # "Outcome of Board Meeting" (NSE) vs "Board Meeting Outcome" (BSE)
-            if ratio > 0.65: is_dupe = True
+    a = clean_text(last["title"] + last.get("summary", ""))
+    b = clean_text(event["title"] + event.get("summary", ""))
 
-        if is_dupe:
-            logger.info(
-                f"Duplicate Blocked [{last_event['source']} vs {current_event['source']} | R:{ratio:.2f}]: {current_event['clean_name']}")
-            return True
-    await _update_last_event_cache(last_event_key, current_event)
+    ratio = difflib.SequenceMatcher(None, a, b).ratio()
+
+    if last["source"] == event["source"]:
+        is_dupe = ratio > 0.90
+    else:
+        is_dupe = ratio > 0.65
+
+    if is_dupe:
+        logger.info(f"Duplicate blocked [{ratio:.2f}] {event['clean_name']}")
+        return True
+
+    await _update_last_event_cache(cache_key, event)
     return False
 
 
 async def _is_noise(event):
     await _refresh_keywords_if_needed()
 
-    name = event['clean_name']
-    title = (event.get('title') or "").upper()
-    summary = (event.get('summary') or "").upper()
+    name = event["clean_name"].upper()
+    title = event["title"].upper()
+    summary = (event.get("summary") or "").upper()
 
-    # 1. Mutual Funds / ETFs check
-    if any(x in name for x in ["MUTUAL FUND", "ETF", "BOND", "NIFTY 50", "SENSEX"]):
+    if any(x in name for x in ["MUTUAL FUND", "ETF", "BOND", "NIFTY", "SENSEX", "FMP ", "DEBENTURE"]):
         return True, "NON_EQUITY", None
 
-    # 3. Bad Keywords
-    for kw in CACHED_BAD_KEYWORDS:
-        keyword = kw.upper()
-        if keyword in title or keyword in summary:
-            return True, f"BLOCKED: {keyword}", None
-
-    # SHADOW_KEYWORDS
     shadow_violation = None
-    for kw in CACHED_SHADOW_KEYWORDS:
-        keyword = kw.upper()
-        if keyword in title or keyword in summary:
-            shadow_violation = keyword
-            break
+
+    for kw in CACHED_BAD_KEYWORDS:
+        if kw in title or kw in summary:
+            if any(w in title for w in CORP_ACTION_WHITELIST):
+                shadow_violation = kw
+                break
+            return True, f"BLOCKED:{kw}", None
+
+    if not shadow_violation:
+        for kw in CACHED_SHADOW_KEYWORDS:
+            if kw in title or kw in summary:
+                shadow_violation = kw
+                break
 
     return False, None, shadow_violation
 
@@ -144,40 +185,66 @@ class EventFilter:
         self.input_queue = "QUEUE:NORMALIZED_EVENTS"
         self.output_queue = "QUEUE:FILTERED_EVENTS"
 
-    async def process_event(self, raw_event_json):
+    async def process_event(self, raw):
         try:
-            event = json.loads(raw_event_json)
+            event = json.loads(raw)
 
-            is_junk, reason, shadow_violation = await _is_noise(event)
-            if is_junk:
-                logger.info(f"Filtered: {event['clean_name']} | {reason}")
+            # --- 1. FILTER CHECK ---
+            junk, reason, shadow = await _is_noise(event)
+
+            if junk:
+                event["status"] = "REJECTED"
+                event["rejection_reason"] = reason
+
+                # CRITICAL FIX: Save to DB for Feedback Layer, then STOP
+                await raw_events.insert_one(event)
+                logger.info(f"Filtered {event['clean_name']} | {reason}")
+                return  # <--- THIS RETURN WAS MISSING
+
+            # --- 2. ENRICHMENT ---
+            event["status"] = "ACCEPTED"
+            if shadow:
+                event["shadow_violation"] = shadow
+
+            # Metadata
+            event["event_ts"] = event["ingestion_ts"]
+            latency = event.get("latency_seconds", 0)
+            disclosure_phase = event.get("disclosure_market_phase")
+            event["late_news_risk"] = (latency > 1800 and disclosure_phase == "LIVE")
+            if latency == 0 and disclosure_phase == "LIVE":
+                event["late_news_risk"] = True
+
+            event["event_type"] = classify_event_type(event["title"])
+            event["filtered_at"] = datetime.now(timezone.utc).isoformat()
+            # ISIN Lookup
+            event["isin"] = await _get_isin(event["join_key"], event["source"])
+
+            event["timestamp"] = datetime.now(timezone.utc).isoformat()
+            event["urgency"] = (
+                "HIGH" if event.get("event_urgency") == "EXTREME" and not event.get("late_news_risk") else "LOW")
+
+            # --- 3. DEDUPLICATION ---
+            if await _check_smart_similarity(event["isin"], event):
                 return
 
-            if shadow_violation:
-                event['shadow_violation'] = shadow_violation
-                logger.info(f"Shadow Match: {event['clean_name']} (Allowed)")
-
-            event['status'] = "ACCEPTED"
-            event['filtered_at'] = datetime.now(IST).isoformat()
-            event['isin'] = await _get_isin(event['join_key'], event['source'])
-
-            if await _check_smart_similarity(event['isin'], event):
-                return
-
+            # --- 4. SUCCESS: SAVE & PUSH ---
             await raw_events.insert_one(event)
 
-            if '_id' in event:
-                event['_id'] = str(event['_id'])
+            if "_id" in event:
+                event["_id"] = str(event["_id"])
 
-            # Push to Redis
-            await redis_client.rpush(self.output_queue, json.dumps(event, default=json_serial))
-            logger.info(f"Passed: {event['clean_name']}")
+            await redis_client.rpush(
+                self.output_queue,
+                json.dumps(event, default=json_serial)
+            )
+
+            logger.info(f"Accepted {event['clean_name']}")
 
         except Exception as e:
-            logger.error(f"Filter Error: {e}")
+            logger.error(f"Filter error: {e}", exc_info=True)
 
     async def run(self):
-        logger.info("Event Filter Active...")
+        logger.info("Event Filter Started")
         while True:
             item = await redis_client.blpop(self.input_queue, timeout=60)
             if item:

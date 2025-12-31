@@ -1,454 +1,391 @@
 import asyncio
 import json
 import logging
-import re
-from datetime import datetime, time
+import math
+import uuid
+from datetime import datetime, time, timezone
 from typing import Dict, Tuple, Optional
-
-import aiohttp
+from redis import WatchError
 import pandas as pd
 import pandas_ta as ta
 import pytz
-from bson import ObjectId
+from bot_config import BotConfig
 from utils.angel_one_bridge import angel_bridge
 from config import redis_client, trade_signals, technical_audit
 
-IST = pytz.timezone('Asia/Kolkata')
-MARKET_OPEN = time(9, 15)
-MARKET_CLOSE = time(15, 30)
-DEFAULT_ATR_MULTIPLIER = 1.5
-LIQUIDITY_THRESHOLDS = {
-    "HIGH_CAP": 10_000_000,
-    "MID_CAP": 5_000_000,
-    "SMALL_CAP": 1_000_000
-}
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+IST = pytz.timezone("Asia/Kolkata")
+
+MAX_CAPITAL_ALLOCATION = 500_000
+MAX_LOSS_STREAK = 3
+
+REGIME_CACHE_SECONDS = 300
+
+MARKET_START = time(9, 14)
+MARKET_LAST_ENTRY = time(15, 0)
+FORCE_EXIT_TIME = "15:15 IST"
+
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("TECHNICAL_ENGINE")
 
+
 def json_serial(obj):
-    if isinstance(obj, (datetime, pd.Timestamp)): return obj.isoformat()
-    if isinstance(obj, ObjectId): return str(obj)
+    if isinstance(obj, datetime):
+        if obj.tzinfo is None:
+            obj = obj.replace(tzinfo=timezone.utc)
+        return obj.isoformat()
     raise TypeError(f"Type {type(obj)} not serializable")
 
-def get_market_phase() -> str:
-    now = datetime.now(IST)
-    if now.weekday() >= 5: return "WEEKEND"
-    t = now.time()
-    if t < MARKET_OPEN: return "PRE_OPEN"
-    if MARKET_OPEN <= t <= MARKET_CLOSE: return "LIVE"
-    return "POST_MARKET"
+async def audit(event, ticker, decision, reason, stats=None):
+    await technical_audit.insert_one({
+        "event_id": event.get("event_id"),
+        "ticker": ticker,
+        "decision": decision,
+        "reason": reason,
+        "stats": stats,
+        "timestamp": datetime.now(IST).isoformat()
+    })
+
+class GlobalRiskGovernor:
+
+    @staticmethod
+    async def try_reserve_capacity(config):
+        if await redis_client.exists("MARKET:HALT"):
+            return False, "MARKET_HALTED"
+
+        # We use a Redis Pipeline to ensure atomicity
+        async with redis_client.pipeline() as pipe:
+            while True:
+                try:
+                    await pipe.watch(
+                        "RISK:DAILY_PNL_PCT",
+                        "RISK:LOSS_STREAK",
+                        "RISK:OPEN_TRADES_COUNT",
+                    )
+
+                    # 2. READ current values
+                    daily_pnl = float(await redis_client.get("RISK:DAILY_PNL_PCT") or 0)
+                    loss_streak = int(await redis_client.get("RISK:LOSS_STREAK") or 0)
+                    open_trades = int(await redis_client.get("RISK:OPEN_TRADES_COUNT") or 0)
+
+                    # 3. CHECK Limits (The Logic)
+                    if daily_pnl <= config.MAX_DAILY_LOSS_PCT:
+                        await pipe.unwatch()
+                        return False, "DAILY_DRAWDOWN_LIMIT"
+                    if loss_streak >= MAX_LOSS_STREAK:
+                        await pipe.unwatch()
+                        return False, "LOSS_STREAK_LIMIT"
+                    if open_trades >= config.MAX_CONCURRENT_TRADES:
+                        await pipe.unwatch()
+                        return False, "MAX_CONCURRENT_TRADES"
+
+
+                    # 4. ACT (Increment Counters)
+                    pipe.multi()  # Start transaction block
+                    pipe.incr("RISK:OPEN_TRADES_COUNT")
+                    await pipe.execute()  # Commit transaction
+                    return True, "OK"
+
+                except WatchError:
+                    continue
+
+
+class SymbolStateMachine:
+
+    @staticmethod
+    async def clear_all_locks():
+        keys = await redis_client.keys("STATE:*")
+        if keys:
+            await redis_client.delete(*keys)
+            logger.info(f"Cleared {len(keys)} stale symbol locks")
+
+    @staticmethod
+    async def validate(ticker: str, signal: str) -> Tuple[bool, str]:
+
+        if await redis_client.exists(f"DAILY_TRADED:{ticker}"):
+            return False, "ALREADY_TRADED_TODAY"
+
+        state = await redis_client.get(f"STATE:{ticker}")
+        if state:
+            s = state
+            if "LONG" in s and signal == "SELL":
+                return False, "REVERSAL_BLOCKED"
+            if "SHORT" in s and signal == "BUY":
+                return False, "REVERSAL_BLOCKED"
+
+        return True, "OK"
+
+    @staticmethod
+    async def lock(ticker: str, signal: str):
+        await redis_client.setex(f"STATE:{ticker}", 64800, f"ACTIVE_{signal}")
+        await redis_client.setex(f"DAILY_TRADED:{ticker}", 64800, "TRUE")
+
+
+class MarketRegimeDetector:
+
+    @staticmethod
+    async def get() -> str:
+        cached = await redis_client.get("MARKET:REGIME")
+        if cached:
+            return cached
+
+        df = await asyncio.to_thread(
+            angel_bridge.get_historical_candles,
+            "NIFTY",
+            "FIVE_MINUTE",
+            5
+        )
+        if df is None or df.empty:
+            return "RANGING"
+
+        df["ATR"] = ta.atr(df.High, df.Low, df.Close, 14)
+        atr, atr_ma = df.ATR.iloc[-1], df.ATR.rolling(20).mean().iloc[-1]
+        close, sma50 = df.Close.iloc[-1], df.Close.rolling(50).mean().iloc[-1]
+
+        if atr > atr_ma * 2:
+            regime = "PANIC"
+        elif abs(close - sma50) > sma50 * 0.005:
+            regime = "TRENDING"
+        else:
+            regime = "RANGING"
+
+        await redis_client.setex("MARKET:REGIME", REGIME_CACHE_SECONDS, regime)
+        return regime
 
 
 class MarketDataService:
-    def __init__(self):
-        pass
 
     @staticmethod
-    async def get_ohlcv(ticker: str) -> Optional[pd.DataFrame]:
-        try:
-            df = await asyncio.to_thread(
-                angel_bridge.get_historical_candles,
-                symbol=ticker,
-                interval="FIVE_MINUTE",
-                days=5
-            )
-
-            if df is None or df.empty or len(df) < 50: return None
-            if df.index.tz is None:
-                df.index = df.index.tz_localize(IST)
-            else:
-                df.index = df.index.tz_convert(IST)
-
-            daily_df = await asyncio.to_thread(
-                angel_bridge.get_historical_candles,
-                symbol=ticker,
-                interval="ONE_DAY",
-                days=5
-            )
-
-            if daily_df is not None and not daily_df.empty:
-                if len(daily_df) >= 2:
-                    prev_close = daily_df['Close'].iloc[-2]
-                else:
-                    prev_close = daily_df['Close'].iloc[0]
-            else:
-                prev_close = df['Close'].iloc[0]
-
-            df.attrs['daily_prev_close'] = float(prev_close)
-            return df
-
-        except Exception as e:
-            logger.warning(f"Fetch failed for {ticker}: {e}")
+    async def get_df(symbol: str) -> Optional[pd.DataFrame]:
+        df = await asyncio.to_thread(
+            angel_bridge.get_historical_candles,
+            symbol,
+            "FIVE_MINUTE",
+            5
+        )
+        if df is None or df.empty:
             return None
+        df.index = df.index.tz_localize(IST) if df.index.tz is None else df.index
+        return df
 
     @staticmethod
-    async def get_realtime_price(ticker):
-        return await asyncio.to_thread(angel_bridge.get_ltp, ticker)
+    def indicators(df: pd.DataFrame) -> Dict:
+        df = df.copy()
 
-    async def get_market_trend(self) -> str:
-        try:
-            df = await self.get_ohlcv("NIFTY")
-            if df is None: return "NEUTRAL"
-            close = df['Close'].iloc[-1]
-            sma50 = df['Close'].rolling(50).mean().iloc[-1]
-            if close > (sma50 * 1.001): return "BULLISH"
-            if close < (sma50 * 0.999): return "BEARISH"
-            return "NEUTRAL"
-        except:
-            return "NEUTRAL"
+        tp = (df.High + df.Low + df.Close) / 3
+        df["VWAP"] = (tp * df.Volume).groupby(df.index.date).cumsum() / df.Volume.groupby(df.index.date).cumsum()
 
-class SymbolResolver:
-    def __init__(self):
-        self.session = None
+        df["RSI"] = ta.rsi(df.Close, 14)
+        df["ATR"] = ta.atr(df.High, df.Low, df.Close, 14)
 
-    async def initialize(self):
-        self.session = aiohttp.ClientSession(headers={
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        })
-        logger.info("Resolver Ready (On-Demand Redis Mode)")
-
-    @staticmethod
-    async def _get_isin_metadata(isin, exchange):
-        key = f"CONFIG:ISIN:{exchange}"
-        data = await redis_client.hget(key, isin)
-        if data:
-            try:
-                return json.loads(data) if isinstance(data, str) and data.startswith("{") else data
-            except:
-                return data
-        return None
-
-    async def resolve(self, event: dict) -> Tuple[str, str]:
-        # 1. ISIN Lookup (Direct Redis Fetch)
-        isin = event.get('isin')
-        if isin:
-            # Check NSE
-            nse_data = await self._get_isin_metadata(isin, "NSE")
-            if nse_data and isinstance(nse_data, dict):
-                return nse_data.get("nse_symbol", ""), "NSE"
-
-            # Check Symbol Map
-            symbols_raw = await redis_client.hget("CONFIG:ISIN:SYMBOL", isin)
-            if symbols_raw:
-                symbols = json.loads(symbols_raw)
-                if symbols:
-                    nse = next((s for s in symbols if ".NS" in s), None)
-                    if nse: return nse, "NSE"
-                    return symbols[0], "BSE"
-
-        clean = re.sub(r'[^A-Z0-9]', '', event.get('clean_name', '').upper())
-        return f"{clean}.NS", "NSE"
-
-    async def close(self):
-        if self.session: await self.session.close()
-
-
-class IndicatorEngine:
-    @staticmethod
-    def analyze(df: pd.DataFrame) -> Optional[Dict]:
-        try:
-            df = df.copy()
-
-            # 1. VWAP
-            df['date'] = df.index.date
-            df['tpv'] = (df['High'] + df['Low'] + df['Close']) / 3 * df['Volume']
-            df['vwap'] = df.groupby('date')['tpv'].cumsum() / df.groupby('date')['Volume'].cumsum()
-
-            # 2. Advanced Indicators
-            df['RSI_14'] = ta.rsi(df['Close'], length=14)
-            df['ATRr_14'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
-            df['SMA_20'] = ta.sma(df['Close'], length=20)
-
-            last = df.iloc[-1]
-
-            daily_prev_close = df.attrs.get('daily_prev_close', last['Close'])
-            daily_change_pct = (last['Close'] - daily_prev_close) / daily_prev_close
-
-            # 3. Relative Volume (RVOL)
-            avg_vol = df['Volume'].rolling(20).mean().iloc[-1]
-            rvol = last['Volume'] / avg_vol if avg_vol > 0 else 1.0
-            turnover = last['Close'] * avg_vol
-
-            return {
-                "price": float(last['Close']),
-                "daily_prev_close": float(daily_prev_close),
-                "daily_change_pct": float(daily_change_pct),
-                "vwap": float(last['vwap']),
-                "rsi": float(last['RSI_14']),
-                "atr": float(last['ATRr_14']),
-                "sma_20": float(last['SMA_20']),
-                "rvol": float(rvol),
-                "turnover": float(turnover),
-                "timestamp": df.index[-1].to_pydatetime()
-            }
-        except Exception as e:
-            logger.error(f"Indicator Error: {e}")
-            return None
-
-class TechnicalEngine:
-    def __init__(self):
-        self.resolver = SymbolResolver()
-        self.data = MarketDataService()
-        self.indicators = IndicatorEngine()
-        self.input_queue = "QUEUE:AI_SIGNALS"
-        self.output_queue = "QUEUE:TRADE_SIGNALS"
-        self.liq_small_cap = 1_000_000
-        self.atr_multiplier = 1.5
-        self.rvol_threshold = 2.0
-        self.chase_pct = 0.04
-
-    async def initialize(self):
-        await self.resolver.initialize()
-        await angel_bridge.initialize()
-        logger.info("Technical Engine Ready")
-
-    async def update_config(self):
-        try:
-            liq = await redis_client.get("CONFIG:DYNAMIC:LIQUIDITY_SMALL_CAP")
-            if liq: self.liq_small_cap = int(liq)
-
-            atr = await redis_client.get("CONFIG:DYNAMIC:ATR_MULTIPLIER")
-            if atr: self.atr_multiplier = float(atr)
-
-            rvol = await redis_client.get("CONFIG:DYNAMIC:RVOL_THRESHOLD")
-            if rvol: self.rvol_threshold = float(rvol)
-
-            chase = await redis_client.get("CONFIG:DYNAMIC:CHASE_PROTECTION_PCT")
-            if chase: self.chase_pct = float(chase)
-
-            logger.info(
-                f"CONFIG: Liq={self.liq_small_cap}, ATR={self.atr_multiplier}, RVOL={self.rvol_threshold}, Chase={self.chase_pct}")
-        except Exception:
-            pass
-
-    @staticmethod
-    def _validate_trade(stats, ai, phase, market_trend, liq_threshold, rvol_threshold, chase_pct) -> Tuple[str, str]:
-
-        daily_move = stats['daily_change_pct']
-
-        # Prevent Shorting if stock crashed > 9% (Trap Risk)
-        if ai['signal'] == "SELL" and daily_move < -0.09:
-            return "BLOCKED", f"CIRCUIT_RISK_DOWN_{daily_move * 100:.1f}%"
-
-        # Prevent Buying if stock rallied > 12% (Trap Risk)
-        if ai['signal'] == "BUY" and daily_move > 0.12:
-            return "BLOCKED", f"CIRCUIT_RISK_UP_{daily_move * 100:.1f}%"
-
-        # --- A. Pump & Dump Shield ---
-        is_small_cap = stats['turnover'] < 5_000_000
-        if is_small_cap and stats['rvol'] > 5.0 and ai.get('tier') != "EXTREME":
-            return "BLOCKED", f"PUMP_DUMP_RISK_RVOL_{stats['rvol']:.1f}"
-
-        # --- B. Liquidity Check ---
-        min_liq = liq_threshold
-        if stats['price'] > 500:
-            min_liq = max(min_liq * 5, 5_000_000)
-
-        if stats['turnover'] < min_liq:
-            return "BLOCKED", f"LOW_LIQ_₹{int(stats['turnover'] / 1000)}k"
-
-        # --- C. Chase Protection
-        daily_chg = abs(stats['daily_change_pct'])
-        if daily_chg > chase_pct and ai.get('tier') != "EXTREME":
-            return "BLOCKED", f"MOVE_DONE_{daily_chg * 100:.1f}%"
-
-        # --- D. Market Confluence ---
-        tier = ai.get('tier', 'MODERATE')
-        signal = ai['signal']
-
-        if tier == "EXTREME":
-            pass  # Free Pass
-
-        elif tier == "VERY":
-            is_headwind = (market_trend == "BEARISH" and signal == "BUY") or \
-                          (market_trend == "BULLISH" and signal == "SELL")
-
-            if is_headwind:
-                # Dynamic RVOL check
-                if stats['rvol'] < rvol_threshold:
-                    return "BLOCKED", f"HEADWIND_LOW_VOL_{stats['rvol']:.1f}"
-
-                # Headwind specific safety
-                if signal == "BUY" and stats['price'] < stats['vwap']:
-                    return "BLOCKED", "HEADWIND_BELOW_VWAP"
-                if signal == "SELL" and stats['price'] > stats['vwap']:
-                    return "BLOCKED", "HEADWIND_ABOVE_VWAP"
-
-        else:  # MODERATE
-            if market_trend == "BEARISH" and signal == "BUY":
-                return "BLOCKED", "MARKET_HEADWIND"
-            if market_trend == "BULLISH" and signal == "SELL":
-                return "BLOCKED", "MARKET_HEADWIND"
-
-        # --- E. Technical Setup ---
-        if signal == "BUY":
-            if stats['price'] > (stats['sma_20'] * 1.10): return "BLOCKED", "OVEREXTENDED_10%"
-            if stats['rsi'] > 75: return "BLOCKED", f"RSI_HOT_{int(stats['rsi'])}"
-
-            # VWAP Support
-            if phase == "LIVE" and stats['price'] < stats['vwap'] and tier not in ["EXTREME", "VERY"]:
-                return "BLOCKED", "BELOW_VWAP"
-
-        elif signal == "SELL":
-            if stats['rsi'] < 25: return "BLOCKED", f"RSI_COLD_{int(stats['rsi'])}"
-
-            # VWAP Resistance
-            if phase == "LIVE" and stats['price'] > stats['vwap'] and tier not in ["EXTREME", "VERY"]:
-                return "BLOCKED", "ABOVE_VWAP"
-
-        return "EXECUTED", f"VALID_{phase}"
-
-    @staticmethod
-    def _construct_order(ticker, ai, stats, reason, phase, atr_mult, event_id,source):
-        limit_price, sl, tp = 0, 0, 0
-        price = stats['price']
-        atr = stats['atr']
-        tier = ai.get('tier', 'MODERATE')
-
-        # --- Safety Settings ---
-        # Never allow SL to be closer than 1.0% (Prevents "Noise" Stop-outs)
-        min_sl_pct = 0.01
-
-        # 1. Determine Tolerance (Slippage protection for Limit Order)
-        gap_tolerance = 0.02 if tier == "EXTREME" else 0.01
-
-        # 2. Calculate Limit Price (The Boundary)
-        if ai['signal'] == "BUY":
-            limit_price = price * (1 + gap_tolerance)
-        elif ai['signal'] == "SELL":
-            limit_price = price * (1 - gap_tolerance)
-
-        # 3. Order Type
-        order_type = "LIMIT"
-
-        # 4. Dynamic Stops & Targets (The Critical Fix)
-        base_mult = atr_mult
-        final_mult = base_mult + 0.5 if tier == "EXTREME" else base_mult
-
-        # Calculate the raw distance based on Volatility (ATR)
-        raw_sl_distance = atr * final_mult
-
-        # Calculate the minimum safety distance (1% of price)
-        min_safety_distance = price * min_sl_pct
-
-        # Use the LARGER distance (Safest option)
-        actual_sl_distance = max(raw_sl_distance, min_safety_distance)
-
-        # Recalculate TP to maintain Risk:Reward Ratio (1:2.5) based on actual SL
-        actual_tp_distance = actual_sl_distance * 2.5
-
-        if ai['signal'] == "BUY":
-            sl = price - actual_sl_distance
-            tp = price + actual_tp_distance
-        elif ai['signal'] == "SELL":
-            sl = price + actual_sl_distance
-            tp = price - actual_tp_distance
-
-        now_ist = datetime.now(IST)
-        naive_ist_time = now_ist.replace(tzinfo=None)
+        avg_vol = df.Volume.rolling(20).mean().iloc[-1]
+        rvol = df.Volume.iloc[-1] / avg_vol if avg_vol and avg_vol > 0 else 1.0
 
         return {
-            "event_id": event_id,
-            "source": source,
-            "symbol": ticker,
-            "signal": ai['signal'],
-            "order_type": order_type,
-            "entry": round(price, 2),
-            "limit_price": round(limit_price, 2),
-            "stop_loss": round(sl, 2),
-            "take_profit": round(tp, 2),
-            "quantity_score": 10 if tier == "EXTREME" else 5,
-            "ai_analysis": ai,
-            "instructions": {
-                "rsi": round(stats.get('rsi', 0), 2),
-                "status": reason
-            },
-            "phase": phase,
-            "timestamp": naive_ist_time
+            "price": float(df.Close.iloc[-1]),
+            "vwap": float(df.VWAP.iloc[-1]),
+            "rsi": float(df.RSI.iloc[-1]),
+            "atr": float(df.ATR.iloc[-1]),
+            "rvol": float(rvol)
         }
 
-    @staticmethod
-    async def _audit(event, ticker, decision, reason, phase, stats=None):
+
+class TechnicalEngine:
+
+    async def process(self, event: dict):
+        config = await BotConfig.load()
+        # 1. Symbol Lookup
+        symbols = await redis_client.hget("CONFIG:ISIN:SYMBOL", event["isin"])
+        if not symbols:
+            await audit(event, "UNKNOWN", "REJECTED", "SYMBOL_NOT_FOUND")
+            return
+        ticker = json.loads(symbols)[0]
+
+        # 2. Extract AI Data (Fixing the Missing Data Issue)
+        ai = event["ai_analysis"]
+        summary_data = event.get("ai_summary", {})
+
+        signal = ai["signal"]
+        tier = ai.get("tier", "MODERATE")
+        catalyst = ai.get("catalyst", "Unknown")
+
+        # 3. Urgency Check
+        urgency = event.get("urgency", "LOW")
+        if urgency == "LOW" and tier != "EXTREME":
+            await audit(event, ticker, "REJECTED", "LOW_URGENCY")
+            return
+
+        now = datetime.now(IST).time()
+        regime = await MarketRegimeDetector.get()
+
+        # 4. Time Filters (Refined for Real Market)
+
+        # Opening Volatility: Skip unless Extreme
+        if time(9, 15) <= now <= time(9, 35):
+            if tier != "EXTREME":
+                await audit(event, ticker, "REJECTED", "OPEN_VOLATILITY_FILTER")
+                return
+
+        # Noon Chop: Allow Extreme news even during chop
+        if time(11, 30) <= now <= time(13, 0):
+            if regime != "TRENDING" and tier != "EXTREME":
+                await audit(event, ticker, "REJECTED", "NOON_CHOP_FILTER")
+                return
+
+        if not (MARKET_START <= now <= MARKET_LAST_ENTRY):
+            await audit(event, ticker, "REJECTED", "OUTSIDE_MARKET_HOURS")
+            return
+
+        # 5. State & Data
+        ok, msg = await SymbolStateMachine.validate(ticker, signal)
+        if not ok:
+            await audit(event, ticker, "REJECTED", msg)
+            return
+
+        df = await MarketDataService.get_df(ticker)
+        if df is None:
+            await audit(event, ticker, "REJECTED", "NO_DATA")
+            return
+
+        stats = MarketDataService.indicators(df)
+
         try:
-            doc = {
-                "event_id": event.get('event_id'),
-                "ticker": ticker,
-                "decision": decision,
-                "reason": reason,
-                "phase": phase,
-                "stats": stats,
-                "ai_tier": event.get('ai_analysis', {}).get('tier'),
-                "timestamp": datetime.now(IST)
-            }
-            await technical_audit.insert_one(doc)
+            ltp_data = await asyncio.to_thread(angel_bridge.get_ltp, ticker)
+
+            if not ltp_data:
+                await audit(event, ticker, "REJECTED", "LTP_FETCH_FAILED_NULL", stats)
+                return
+
+            current_price = float(ltp_data)
+
         except Exception as e:
-            logger.error(f"Audit Error: {e}")
+            logger.error(f"LTP Fetch Error for {ticker}: {e}")
+            await audit(event, ticker, "REJECTED", "LTP_API_ERROR", stats)
+            return
+            # Update stats with the REAL verified price
+        stats["price"] = current_price
 
+        price, vwap, atr, rvol = stats["price"], stats["vwap"], stats["atr"], stats["rvol"]
 
-    async def process_event(self, event: dict):
-        ticker, exch = await self.resolver.resolve(event)
-        phase = get_market_phase()
-        ai = event.get('ai_analysis', {})
-
-        logger.info(f"Processing: {ticker} | AI: {ai.get('signal')}")
-
-        df = await self.data.get_ohlcv(ticker)
-
-        if df is None or df.empty:
-            await self._audit(event, ticker, "BLOCKED", "DATA_UNAVAILABLE", phase)
+        # 6. Technical Checks
+        if regime == "PANIC":
+            if signal == "BUY":
+                await audit(event, ticker, "REJECTED", "PANIC_NO_BUY", stats)
+            if tier != "EXTREME":
+                await audit(event, ticker, "REJECTED", "PANIC_TIER", stats)
             return
 
-        market_trend_task = asyncio.create_task(self.data.get_market_trend())
-        market_trend = await market_trend_task
 
-        stats = self.indicators.analyze(df)
-        if not stats:
-            await self._audit(event, ticker, "BLOCKED", "CALC_ERROR", phase)
+        if rvol < 1.2 and tier != "EXTREME":
+            await audit(event, ticker, "REJECTED", "LOW_RVOL", stats)
             return
 
-        decision, reason = self._validate_trade(
-            stats, ai, phase, market_trend,
-            liq_threshold=self.liq_small_cap,
-            rvol_threshold=self.rvol_threshold,
-            chase_pct=self.chase_pct
-        )
-        await self._audit(event, ticker, decision, reason, phase, stats)
+        # Gap Risk (Real Market Scenario: Don't buy if it already jumped 6%)
+        gap_limit = 0.06 if tier != "EXTREME" else 0.12
 
-        if decision == "EXECUTED":
-            signal = self._construct_order(
-                ticker, ai, stats, reason, phase,
-                atr_mult=self.atr_multiplier,
-                event_id=event.get('event_id'),
-                source=event.get('source', 'SRC_ERR')
-            )
-            await redis_client.rpush(self.output_queue, json.dumps(signal, default=json_serial))
-            await trade_signals.insert_one(signal)
-            logger.info(f"SIGNAL: {ticker} ({ai['signal']}) | {reason}")
+        if abs(price - vwap) / vwap > gap_limit:
+            await audit(event, ticker, "REJECTED", "GAP_RISK", stats)
+            return
+
+        # Momentum Alignment
+        if signal == "BUY" and price < vwap and tier != "EXTREME":
+            await audit(event, ticker, "REJECTED", "BELOW_VWAP", stats)
+            return
+
+        # 7. Sizing & Targets
+        atr_mult = 2.2 if tier == "EXTREME" else 2.0
+        prev_low = df.Low.iloc[-2]
+        prev_high = df.High.iloc[-2]
+
+        if signal == "BUY":
+            sl = min(prev_low, vwap - atr)
         else:
-            logger.info(f"BLOCKED: {ticker} | {reason}")
+            sl = max(prev_high, vwap + atr)
+
+        risk_per_share = abs(price - sl)
+
+        if risk_per_share < (price * 0.003):  # Minimum 0.3% risk
+            await audit(event, ticker, "REJECTED", "STOP_TOO_TIGHT", stats)
+            return
+
+        # Calculate Quantity
+        effective_conf = ai.get("confidence_adjusted", 0.6)
+        risk_multiplier = 1.3 if effective_conf >= 0.80 else (0.7 if effective_conf < 0.60 else 1.0)
+
+        qty = math.floor((MAX_CAPITAL_ALLOCATION * config.RISK_PER_TRADE_PCT * risk_multiplier) / risk_per_share)
+        max_liq_qty = int(df.Volume.iloc[-1] * 0.05)
+        qty = min(qty, max_liq_qty)
+        cap_limit = math.floor((MAX_CAPITAL_ALLOCATION * config.MAX_POSITION_SIZE_PCT) / price)
+        qty = min(qty, cap_limit)
+
+        if qty <= 0:
+            await audit(event, ticker, "REJECTED", "SIZE_TOO_SMALL", stats)
+            return
+
+        # 8. Capacity Reservation
+        reserved, reason = await GlobalRiskGovernor.try_reserve_capacity(config)
+        if not reserved:
+            await audit(event, ticker, "REJECTED", reason, stats)
+            return
+
+        # 9. Construct Final Payload (Enriched)
+        trade_id = str(uuid.uuid4())
+
+        # Calculate Technical Confidence Score
+        tech_confidence = 0.6
+        if tier == "EXTREME": tech_confidence += 0.15
+        if rvol > 2.0: tech_confidence += 0.1
+        if regime == "TRENDING": tech_confidence += 0.05
+        tech_confidence = max(0.4, min(tech_confidence, 0.95))
+
+        payload = {
+            "trade_id": trade_id,
+            "symbol": ticker,
+            "signal": signal,  # Standardized name
+            "order_type": "MARKET",  # Usually safer for news trading than LIMIT
+            "quantity": qty,
+
+            # --- THE MISSING AI DATA ---
+            "reason": catalyst,  # Passed to execution for logging
+            "ai_confidence": ai.get("confidence_adjusted"),
+            "tech_confidence": round(tech_confidence, 2),
+            "event_summary": summary_data.get("pdf_summary", []),
+            "event_title": event.get("title"),
+
+            "trade_params": {
+                "entry_ref": round(price, 2),
+                "stop_loss": round(sl, 2),
+                "target": round(price + (risk_per_share * 3) if signal == "BUY" else price - (risk_per_share * 3), 2)
+            },
+            "force_exit_time": FORCE_EXIT_TIME,
+            "timestamp": datetime.now(IST).isoformat()
+        }
+
+        try:
+            await SymbolStateMachine.lock(ticker, signal)
+            await redis_client.rpush("QUEUE:TRADE_SIGNALS", json.dumps(payload, default=json_serial))
+            await trade_signals.insert_one(payload)
+
+            await audit(event, ticker, "PUBLISHED", "VALID_SIGNAL", stats)
+            logger.info(f"EXECUTED {ticker} {signal} QTY {qty} | Reason: {catalyst}")
+
+        except Exception as e:
+            logger.critical(f"EXECUTION FAILED: {e}")
+            # Rollback limits
+            await redis_client.decr("RISK:OPEN_TRADES_COUNT")
+            await redis_client.delete(f"TRADE:{trade_id}")
+            await redis_client.delete(f"STATE:{ticker}")  # Unlock symbol
+            return
 
     async def run(self):
-        await self.initialize()
-        logger.info("Technical Engine Listening...")
-        try:
-            while True:
-                try:
-                    item = await redis_client.blpop(self.input_queue, timeout=60)
-                    if item:
-                        asyncio.create_task(self.process_event(json.loads(item[1])))
-                    else:
-                        await asyncio.sleep(0.1)
-                except Exception as e:
-                    logger.error(f"Loop Error: {e}")
-                    await asyncio.sleep(1)
-        finally:
-            await self.resolver.close()
-
+        await angel_bridge.initialize()
+        while True:
+            item = await redis_client.blpop("QUEUE:AI_SIGNALS", timeout=5)
+            if item:
+                await self.process(json.loads(item[1]))
+            else:
+                await asyncio.sleep(0.05)
 
 if __name__ == "__main__":
     engine = TechnicalEngine()
-    try:
-        asyncio.run(engine.run())
-    except KeyboardInterrupt:
-        pass
+    asyncio.run(engine.run())

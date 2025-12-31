@@ -4,7 +4,6 @@ import json
 import re
 from datetime import datetime, timedelta
 from google import genai
-from google.genai.types import GenerateContentResponse
 
 from config import redis_client, raw_events, GEMINI_API_KEY
 
@@ -23,17 +22,11 @@ MODEL_NAME = "gemma-3-27b-it"
 
 async def fetch_events_generator(status, hours=24):
     cutoff = datetime.now() - timedelta(hours=hours)
-    total_count = await raw_events.count_documents({
-        "status": status,
-        "timestamp": {"$gte": cutoff.isoformat()}
-    })
+    total_count = await raw_events.count_documents({"status": status, "ingestion_ts": {"$gte": cutoff.isoformat()}})
     logger.info(f"Found {total_count} total '{status}' events to process.")
     if total_count == 0:
         return
-    cursor = raw_events.find({
-        "status": status,
-        "timestamp": {"$gte": cutoff.isoformat()}
-    })
+    cursor = raw_events.find({"status": status, "ingestion_ts": {"$gte": cutoff.isoformat()}})
 
     current_batch = []
     async for document in cursor:
@@ -169,10 +162,7 @@ async def analyze_leaks():
         """
 
         try:
-            response = client.models.generate_content(
-                model=MODEL_NAME,
-                contents=prompt
-            )
+            response = await call_ai(prompt)
             keywords = clean_and_parse_json(response.text)
             if keywords:
                 logger.info(f"FOUND LEAKS: {keywords}")
@@ -231,10 +221,7 @@ async def analyze_filters():
         """
 
         try:
-            response = client.models.generate_content(
-                model=MODEL_NAME,
-                contents=prompt
-            )
+            response = await call_ai(prompt)
             false_negatives = clean_and_parse_json(response.text)
             if false_negatives:
                 await handle_false_negative_strikes(false_negatives, batch)
@@ -250,3 +237,6 @@ async def run():
     await analyze_shadow_performance()
     await analyze_filters()
     logger.info("Job Complete.")
+
+if __name__ == "__main__":
+    asyncio.run(run())
