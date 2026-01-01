@@ -15,7 +15,7 @@ from utils.utility import normalize_company_name
 
 IST = pytz.timezone("Asia/Kolkata")
 
-POLL_INTERVAL_SECONDS = 10
+POLL_INTERVAL_SECONDS = 60
 REDIS_EXPIRY = 86400  # 1 day
 
 RSS_SOURCES = {
